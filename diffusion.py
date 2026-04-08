@@ -113,6 +113,21 @@ class Diffusion(L.LightningModule):
       
     self.time_conditioning = self.config.algo.time_conditioning
     self.neg_infinity = -1000000.0
+    # --- Mechanism C: Structured Masking ---
+    self.structured_masking = getattr(
+        getattr(self.config.algo, 'structured_masking', None), 'enabled', False)
+    if self.structured_masking:
+        self.sm_r_low = self.config.algo.structured_masking.r_low
+        self.sm_r_high = self.config.algo.structured_masking.r_high
+        self.sm_span_blocks = self.config.algo.structured_masking.span_blocks
+        self.sm_global_t = self.config.algo.structured_masking.global_t
+
+    # --- Mechanism A: Span-Level Loss ---
+    self.span_loss_enabled = getattr(
+        getattr(self.config.algo, 'span_loss', None), 'enabled', False)
+    if self.span_loss_enabled:
+        self.span_loss_lambda = self.config.algo.span_loss.lambda_span
+        self.span_loss_type = self.config.algo.span_loss.type
     self.fast_forward_epochs = None
     self.fast_forward_batches = None
     self._validate_configuration()
@@ -662,49 +677,6 @@ class Diffusion(L.LightningModule):
     return xt.view(B, n_blocks, block_size)
 
 
-
-  
-  # def q_xt(
-  #     self, x, p, block_size=None, sampling_eps_min=None, sampling_eps_max=None,
-  #     noised_mask=None):
-  #   """Computes the noisy sample xt.
-
-  #   Args:
-  #     x: int torch.Tensor with shape (batch_size,
-  #         diffusion_model_input_length), input. 
-  #     p: float torch.Tensor with shape (batch_size, 1).
-  #     block_size: int, block size.
-  #     sampling_eps_min: float, minimum percentage of masked tokens.
-  #     sampling_eps_max: float, maximum percentage of masked tokens.
-  #   """
-  #   if block_size is None:
-  #     block_size = self.block_size
-  #   noised_mask = noised_mask.to(dtype=torch.bool)
-  #   B, L = x.shape
-  
-  #   # move_indices = torch.rand(
-  #   #   * x.shape, device=x.device) <= p
-  #   move_indices = (torch.rand(*x.shape, device=x.device) <= p) & noised_mask
-  #   xt = torch.where(move_indices, self.mask_index, x)
-
-  #   if block_size == 1 and sampling_eps_min == 1.0:
-  #     return torch.full_like(x, self.mask_index)
-
-  #   # no need to resample for bounds 1e-3, 1
-  #   if self.config.training.resample and \
-  #     not (sampling_eps_min == 1e-3 and sampling_eps_max == 1.0):
-  #     xt_blk = xt.reshape(xt.shape[0], -1, block_size)
-  #     xt_blk = self._resample_q_xt(x,
-  #                              xt,
-  #                              move_indices,
-  #                              p,
-  #                              block_size,
-  #                              sampling_eps_min,
-  #                              sampling_eps_max,
-  #                              noised_mask=noised_mask)
-  #     # xt = xt.reshape(xt.shape[0], -1)
-  #     xt = xt_blk.view(B, L)
-  #   return xt
   def q_xt(
     self,
     x,
@@ -721,20 +693,42 @@ class Diffusion(L.LightningModule):
     assert noised_mask is not None, "conditional q_xt requires noised_mask"
     noised_mask = noised_mask.to(device=x.device, dtype=torch.bool)
 
-    move_indices = (torch.rand((B, L), device=x.device) <= p) & noised_mask
-    xt = torch.where(move_indices, self.mask_index, x)
+
+
+    # move_indices = (torch.rand((B, L), device=x.device) <= p) & noised_mask
+    # xt = torch.where(move_indices, self.mask_index, x)
+    # --- Mechanism C: 结构化 masking ---
+    if self.structured_masking:
+        xt = self._structured_mask(x, p, block_size, noised_mask)
+    else:
+        # --- 原始逻辑：per-token 随机 mask ---
+        move_indices = (torch.rand((B, L), device=x.device) <= p) & noised_mask
+        xt = torch.where(move_indices, self.mask_index, x)
+
 
     if block_size == 1 and sampling_eps_min == 1.0:
         return torch.full_like(x, self.mask_index)
 
-    if self.config.training.resample and not (sampling_eps_min == 1e-3 and sampling_eps_max == 1.0):
+    # if self.config.training.resample and not (sampling_eps_min == 1e-3 and sampling_eps_max == 1.0):
+    #     xt_blk = xt.view(B, -1, block_size)
+    #     xt_blk = self._resample_q_xt(
+    #         x=x,
+    #         xt=xt_blk,
+    #         move_indices=move_indices,
+    #         p=p,
+    #         block_size=block_size,
+    #         sampling_eps_min=sampling_eps_min,
+    #         sampling_eps_max=sampling_eps_max,
+    #         noised_mask=noised_mask,
+    #     )
+    #     xt = xt_blk.view(B, L)
+    if (not self.structured_masking) and \
+       self.config.training.resample and \
+       not (sampling_eps_min == 1e-3 and sampling_eps_max == 1.0):
         xt_blk = xt.view(B, -1, block_size)
         xt_blk = self._resample_q_xt(
-            x=x,
-            xt=xt_blk,
-            move_indices=move_indices,
-            p=p,
-            block_size=block_size,
+            x=x, xt=xt_blk, move_indices=(xt == self.mask_index),
+            p=p, block_size=block_size,
             sampling_eps_min=sampling_eps_min,
             sampling_eps_max=sampling_eps_max,
             noised_mask=noised_mask,
@@ -743,6 +737,104 @@ class Diffusion(L.LightningModule):
 
     return xt
 
+  def _structured_mask(self, x, p, block_size, noised_mask):
+    """
+    Mechanism C: 噪声依赖的结构化 masking。
+    
+    - 高噪声 (s(t)≈1): 以 span（多个连续 block）为单位做 mask/保留决策
+    - 低噪声 (s(t)≈0): 标准 per-token 随机 mask
+    - 中间: 平滑过渡
+    
+    span 边界对齐 block 边界，兼容 BD3-LM 的注意力掩码。
+    """
+    B, L = x.shape
+    device = x.device
+    n_blocks = L // block_size
+
+    # p 的形状是 [B, L] 或 [B, 1]，取每个样本的 mask 概率
+    if p.dim() == 2:
+        r_t = p[:, 0]  # [B]，每个样本的 masking ratio
+    else:
+        r_t = p  # scalar
+
+    # 计算结构化程度 s(t)
+    s_t = torch.clamp(
+        (r_t - self.sm_r_low) / (self.sm_r_high - self.sm_r_low + 1e-8),
+        min=0.0, max=1.0
+    )  # [B]
+
+    # span 大小（以 block 数量计）
+    span_blocks = max(1, int(self.sm_span_blocks))
+    # 确保 span_blocks 不超过 answer 区域的 block 数
+    # 计算每个样本 answer 区域有多少 block
+    noised_blk = noised_mask.view(B, n_blocks, block_size)
+    answer_blk_mask = (noised_blk.sum(-1) > 0)  # [B, n_blocks], True = 这个 block 有 answer token
+
+    # 对每个样本独立处理
+    xt = x.clone()
+    
+    for b in range(B):
+        s = s_t[b].item() if s_t.dim() > 0 else s_t.item()
+        r = r_t[b].item() if r_t.dim() > 0 else r_t.item()
+        
+        # 找到 answer 区域的 block indices
+        ans_blk_ids = torch.where(answer_blk_mask[b])[0]
+        if len(ans_blk_ids) == 0:
+            continue
+        n_ans_blocks = len(ans_blk_ids)
+
+        if s > 0.01:  # 有结构化成分
+            # 把 answer blocks 分成 span 组
+            n_spans = max(1, n_ans_blocks // span_blocks)
+            actual_span_size = n_ans_blocks // n_spans  # 每 span 多少个 block
+            
+            # 对每个 span 做整体 mask/保留决策
+            span_mask_decisions = (torch.rand(n_spans, device=device) < r)
+            
+            for sp_idx in range(n_spans):
+                sp_start = sp_idx * actual_span_size
+                sp_end = sp_start + actual_span_size if sp_idx < n_spans - 1 else n_ans_blocks
+                span_blk_ids = ans_blk_ids[sp_start:sp_end]
+                
+                if span_mask_decisions[sp_idx]:
+                    # 整个 span 被 mask
+                    for blk_id in span_blk_ids:
+                        blk_start = blk_id * block_size
+                        blk_end = blk_start + block_size
+                        eligible = noised_mask[b, blk_start:blk_end]
+                        
+                        if s < 1.0:
+                            # 部分 span 内 token 随机揭示（平滑过渡）
+                            unmask_prob = 1.0 - s
+                            keep_mask = (torch.rand(block_size, device=device) < unmask_prob) & eligible
+                            mask_positions = eligible & (~keep_mask)
+                        else:
+                            mask_positions = eligible
+                        
+                        xt[b, blk_start:blk_end] = torch.where(
+                            mask_positions, self.mask_index, x[b, blk_start:blk_end])
+                else:
+                    # 整个 span 保留（不 mask）
+                    pass  # xt 已经 = x.clone()，不需要操作
+        
+        if s < 0.99:  # 有 token 级成分
+            # 对于非结构化部分，在还没被结构化 mask 处理的位置做随机 token mask
+            # 这确保总 mask ratio 接近 r_t
+            for blk_id in ans_blk_ids:
+                blk_start = blk_id * block_size
+                blk_end = blk_start + block_size
+                eligible = noised_mask[b, blk_start:blk_end]
+                already_masked = (xt[b, blk_start:blk_end] == self.mask_index)
+                not_yet_decided = eligible & (~already_masked)
+                
+                if not_yet_decided.any():
+                    # 用 (1-s) 的权重做额外的随机 token mask
+                    token_mask_prob = r * (1 - s)
+                    additional_mask = (torch.rand(block_size, device=device) < token_mask_prob) & not_yet_decided
+                    xt[b, blk_start:blk_end] = torch.where(
+                        additional_mask, self.mask_index, xt[b, blk_start:blk_end])
+
+    return xt
 
   def _sample_prior(self, *batch_dims):
     return self.mask_index * torch.ones(
@@ -1127,13 +1219,32 @@ class Diffusion(L.LightningModule):
       block_size = self.block_size
     n = batch_dims[-1]
     num_blocks = n // block_size
-    _eps_b = torch.rand((batch_dims[0], num_blocks), device=device)
 
-    # antithetic sampling along blocks & batches (for uniform sampling)
-    if self.antithetic_sampling:
-      offset_b = torch.arange(batch_dims[0] * num_blocks, device=device) / (batch_dims[0] * num_blocks)
-      offset_b = offset_b.view(batch_dims[0], num_blocks)
-      _eps_b = (_eps_b / (batch_dims[0] * num_blocks) + offset_b) % 1
+
+    # _eps_b = torch.rand((batch_dims[0], num_blocks), device=device)
+
+    # # antithetic sampling along blocks & batches (for uniform sampling)
+    # if self.antithetic_sampling:
+    #   offset_b = torch.arange(batch_dims[0] * num_blocks, device=device) / (batch_dims[0] * num_blocks)
+    #   offset_b = offset_b.view(batch_dims[0], num_blocks)
+    #   _eps_b = (_eps_b / (batch_dims[0] * num_blocks) + offset_b) % 1
+
+    # --- Mechanism C: 当启用结构化 masking 时，answer 内所有 block 共享同一个 t ---
+    if self.structured_masking and getattr(self, 'sm_global_t', False):
+        _eps_b = torch.rand((batch_dims[0], 1), device=device)
+        if self.antithetic_sampling:
+            offset_b = torch.arange(batch_dims[0], device=device).float() / batch_dims[0]
+            _eps_b = (_eps_b.squeeze(-1) / batch_dims[0] + offset_b) % 1
+            _eps_b = _eps_b.unsqueeze(-1)
+        _eps_b = _eps_b.expand(batch_dims[0], num_blocks)  # 所有 block 共享同一个 t
+    else:
+        # --- 原始逻辑：per-block 独立采样 ---
+        _eps_b = torch.rand((batch_dims[0], num_blocks), device=device)
+        if self.antithetic_sampling:
+            offset_b = torch.arange(batch_dims[0] * num_blocks, device=device) / (batch_dims[0] * num_blocks)
+            offset_b = offset_b.view(batch_dims[0], num_blocks)
+            _eps_b = (_eps_b / (batch_dims[0] * num_blocks) + offset_b) % 1
+
     t = _eps_b
     if block_size != self.config.model.length:
       t = t.repeat_interleave(block_size, dim=-1)
@@ -1184,6 +1295,95 @@ class Diffusion(L.LightningModule):
     # wipe answer (highlights) tokens in cond stream to prevent leakage
     cond[token_mask.bool()] = self.mask_index
     return cond
+
+  def _compute_span_bow_loss(self, model_output, x0, xt, token_mask, block_size):
+    """
+    Mechanism A: Bag-of-Words span-level loss.
+    
+    对于被 mask 的 span，将 span 内的 logits 平均池化，
+    与真实 span 的词袋分布计算 KL 散度。
+    
+    只在 answer 区域的 masked span 上计算。
+    """
+    B, L, V = model_output.shape
+    device = model_output.device
+    n_blocks = L // block_size
+    
+    if token_mask is None:
+        return torch.tensor(0.0, device=device)
+    
+    token_mask_bool = token_mask.bool()
+    span_blocks = max(1, getattr(self, 'sm_span_blocks', 2))
+    
+    total_kl = torch.tensor(0.0, device=device)
+    n_spans_counted = 0
+    
+    # 按 span（多个 block）为单位计算 BoW loss
+    noised_blk = token_mask_bool.view(B, n_blocks, block_size)
+    answer_blk_mask = (noised_blk.sum(-1) > 0)  # [B, n_blocks]
+    
+    for b in range(B):
+        ans_blk_ids = torch.where(answer_blk_mask[b])[0]
+        if len(ans_blk_ids) == 0:
+            continue
+        
+        n_ans_blocks = len(ans_blk_ids)
+        n_spans = max(1, n_ans_blocks // span_blocks)
+        actual_span_size = n_ans_blocks // n_spans
+        
+        for sp_idx in range(n_spans):
+            sp_start_blk = sp_idx * actual_span_size
+            sp_end_blk = sp_start_blk + actual_span_size if sp_idx < n_spans - 1 else n_ans_blocks
+            span_blk_ids = ans_blk_ids[sp_start_blk:sp_end_blk]
+            
+            # 收集 span 内的所有 token 位置
+            span_positions = []
+            for blk_id in span_blk_ids:
+                start = blk_id * block_size
+                end = start + block_size
+                for pos in range(start, min(end, L)):
+                    if token_mask_bool[b, pos]:
+                        span_positions.append(pos)
+            
+            if len(span_positions) == 0:
+                continue
+            
+            span_pos = torch.tensor(span_positions, device=device)
+            
+            # 检查这个 span 是否有被 mask 的 token
+            is_masked = (xt[b, span_pos] == self.mask_index)
+            if not is_masked.any():
+                continue  # span 完全可见，不需要 BoW loss
+            
+            # 预测词袋：pool span 内 masked 位置的 logits
+            masked_pos = span_pos[is_masked]
+            span_logits = model_output[b, masked_pos, :]  # [n_masked, V]
+            pred_bow = F.softmax(span_logits.mean(dim=0), dim=-1)  # [V]
+            
+            # 真实词袋：统计 span 内的 token 分布
+            true_tokens = x0[b, span_pos]  # [n_span_tokens]
+            true_bow = torch.zeros(V, device=device)
+            true_bow.scatter_add_(0, true_tokens, torch.ones_like(true_tokens, dtype=torch.float))
+            true_bow = true_bow / true_bow.sum().clamp(min=1.0)
+            
+            # KL(true || pred)
+            # 避免 log(0)
+            kl = F.kl_div(
+                (pred_bow + 1e-10).log(),
+                true_bow,
+                reduction='sum'
+            )
+            total_kl += kl
+            n_spans_counted += 1
+    
+    if n_spans_counted > 0:
+        # 返回形状与 token_loss 兼容的标量
+        avg_kl = total_kl / n_spans_counted
+        # 广播到 [B, L] 形状（乘以 token_mask 后只在 answer 区域有值）
+        span_loss_map = avg_kl * token_mask.float() / token_mask.float().sum().clamp(min=1.0)
+        return span_loss_map
+    else:
+        return torch.zeros_like(x0, dtype=torch.float)
 
   def _forward_pass_diffusion(self, x0, t=None, sampling_eps_min=None, sampling_eps_max=None,
     token_mask=None):
@@ -1236,6 +1436,28 @@ class Diffusion(L.LightningModule):
       dim=-1,
       index=x0[:, :, None]).squeeze(-1)
     loss = loss_scale * log_p_theta
+
+    # --- Mechanism A: Span-Level BoW Loss ---
+    if self.span_loss_enabled and self.training:
+        # 计算 s(t) 来决定 span loss 的权重
+        if p.dim() == 2:
+            r_t_mean = p[:, 0]  # [B]
+        else:
+            r_t_mean = p.mean()
+        
+        s_t = torch.clamp(
+            (r_t_mean - self.sm_r_low) / (self.sm_r_high - self.sm_r_low + 1e-8),
+            min=0.0, max=1.0
+        ) if self.structured_masking else r_t_mean  # 如果没有 C，用 r_t 作为权重
+        
+        alpha_t = s_t.mean()  # scalar，span loss 权重
+        
+        if alpha_t > 0.01:
+            span_loss = self._compute_span_bow_loss(
+                model_output, x0, xt, token_mask, block_size)
+            combined_loss = token_loss + self.span_loss_lambda * alpha_t * span_loss
+            return combined_loss
+
     return loss
 
   def _loss(self, x0, attention_mask, t=None, sampling_eps_min=None, sampling_eps_max=None):

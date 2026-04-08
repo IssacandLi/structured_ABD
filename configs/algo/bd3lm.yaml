@@ -13,3 +13,16 @@ clip_search_widths: []
 fix_clipping: False
 sampler: semi_ar
 mdlm_loss_scale: False
+# --- Mechanism C: Structured Masking ---
+structured_masking:
+  enabled: False          # 设为 True 启用 Mechanism C
+  r_low: 0.3              # 低于此 masking ratio，纯 token 级 mask
+  r_high: 0.7             # 高于此 masking ratio，纯 span 级 mask
+  span_blocks: 4          # span 大小（以 block 数量计）= span_blocks * block_size 个 token
+  global_t: True          # answer region 内所有 block 共享同一个 t
+
+# --- Mechanism A: Span-Level Loss ---
+span_loss:
+  enabled: False          # 设为 True 启用 Mechanism A
+  lambda_span: 1.0        # span loss 的全局缩放因子
+  type: bow               # 'bow' (Bag-of-Words) 或 'embedding'
