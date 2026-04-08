@@ -10,7 +10,7 @@
 
 module load anaconda3
 source activate /data/lab/yan/peihong_li/condaenvlist/bd3lm
-cd /data/lab/yan/peihong_li/ACL/bd3lms3/bd3lms
+cd /data/lab/yan/peihong_li/ACL/structure_ABD/
 
 BLOCK_SIZE=4
 PRETRAIN_CKPT=kuleshov-group/bd3lm-owt-block_size1024-pretrain
@@ -51,7 +51,7 @@ srun bash -lc '
     data.loss_on_answer_eos=True \
     model.length=1024 \
     block_size='"${BLOCK_SIZE}"' \
-    wandb.name=bd3lm-cnn_dm-cond-block_size'"${BLOCK_SIZE}"' \
+    wandb.name=structured_abd \
     mode=train \
     model.attn_backend=flex \
     training.resample=False \
@@ -61,5 +61,12 @@ srun bash -lc '
     trainer.val_check_interval=50 \
     trainer.limit_train_batches=0.01 \
   	trainer.limit_val_batches=0.01 \
+  	+algo.structured_masking.r_low=0.3 \
+    +algo.structured_masking.r_high=0.7 \
+    +algo.structured_masking.span_blocks=2 \
+    +algo.structured_masking.global_t=True \
+    +algo.span_loss.enabled=True \
+    +algo.span_loss.lambda_span=1.0 \
+    +algo.span_loss.type=bow \
     data.cache_dir='"${DATA_CACHE_DIR}"'
 '
