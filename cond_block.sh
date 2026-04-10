@@ -4,7 +4,7 @@
 #SBATCH --time=48:59:59
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2
-#SBATCH --nodelist=sn17
+#SBATCH --nodelist=sn18
 #SBATCH --gres=gpu:tesla:2
 #SBATCH --mem=300000
 
@@ -51,7 +51,7 @@ srun bash -lc '
     data.loss_on_answer_eos=True \
     model.length=1024 \
     block_size='"${BLOCK_SIZE}"' \
-    wandb.name=structured_abd \
+    wandb.name=structured_abd_4_8_2026_11am \
     mode=train \
     model.attn_backend=flex \
     training.resample=False \
@@ -61,12 +61,13 @@ srun bash -lc '
     trainer.val_check_interval=50 \
     trainer.limit_train_batches=0.01 \
   	trainer.limit_val_batches=0.01 \
-  	+algo.structured_masking.r_low=0.3 \
-    +algo.structured_masking.r_high=0.7 \
-    +algo.structured_masking.span_blocks=2 \
-    +algo.structured_masking.global_t=True \
-    +algo.span_loss.enabled=True \
-    +algo.span_loss.lambda_span=1.0 \
-    +algo.span_loss.type=bow \
+  	algo.structured_masking.enabled=True \
+  	algo.structured_masking.r_low=0.3 \
+    algo.structured_masking.r_high=0.7 \
+    algo.structured_masking.span_blocks=2 \
+    algo.structured_masking.global_t=True \
+    algo.span_loss.enabled=False \
+    algo.span_loss.lambda_span=1.0 \
+    algo.span_loss.type=bow \
     data.cache_dir='"${DATA_CACHE_DIR}"'
 '

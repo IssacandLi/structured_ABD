@@ -4,13 +4,13 @@
 #SBATCH --time=48:59:59
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2
-#SBATCH --nodelist=sn16
+#SBATCH --nodelist=sn17
 #SBATCH --gres=gpu:tesla:2
 #SBATCH --mem=300000
 
 module load anaconda3
 source activate /data/lab/yan/peihong_li/condaenvlist/bd3lm
-cd /data/lab/yan/peihong_li/ACL/bd3lms3_cond_BD/bd3lms
+cd /data/lab/yan/peihong_li/ACL/structure_ABD/
 
 BLOCK_SIZE=4
 
@@ -32,4 +32,16 @@ python -u main.py \
   sampling.kv_cache=false \
   +sampling.context_size=512 \
   sampling.logdir=$PWD/sample_logs/cnn_dm_cond_bs4 \
-  eval.checkpoint_path=$PWD/outputs/cnn_dailymail/2026.03.12/155540/checkpoints/best.ckpt
+  eval.checkpoint_path=$PWD/outputs/cnn_dailymail/2026.04.08/113455/checkpoints/best.ckpt \
+  algo.structured_masking.enabled=True \
+  algo.structured_masking.r_low=0.3 \
+  algo.structured_masking.r_high=0.7 \
+  algo.structured_masking.span_blocks=2 \
+  algo.structured_masking.global_t=True \
+  algo.span_loss.enabled=False \
+  algo.span_loss.lambda_span=1.0 \
+  algo.span_loss.type=bow \
+  algo.structured_inference.enabled=True \
+  algo.structured_inference.aggregation=mean \
+  algo.structured_inference.commitment=mixed \
+  algo.structured_inference.threshold=fixed_ratio

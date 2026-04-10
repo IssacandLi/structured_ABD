@@ -121,6 +121,27 @@ class Diffusion(L.LightningModule):
         self.sm_r_high = self.config.algo.structured_masking.r_high
         self.sm_span_blocks = self.config.algo.structured_masking.span_blocks
         self.sm_global_t = self.config.algo.structured_masking.global_t
+        print("=" * 50)
+        print("  [Mechanism C+A] Structured masking ENABLED")
+        print(f"  r_low={self.sm_r_low}, r_high={self.sm_r_high}, span_blocks={self.sm_span_blocks}")
+        print("  This is NOT vanilla Block Diffusion.")
+        print("=" * 50) 
+    # --- C-inf: Structured Unmasking at Inference ---
+    self.structured_inference = getattr(
+        getattr(self.config.algo, 'structured_inference', None), 'enabled', False)
+    if self.structured_inference:
+        self.cinf_aggregation = self.config.algo.structured_inference.aggregation
+        self.cinf_commitment = self.config.algo.structured_inference.commitment
+        self.cinf_threshold = self.config.algo.structured_inference.threshold
+        # 验证 C 的参数也已加载（C-inf 复用 s(t) 公式）
+        assert self.structured_masking, \
+            "C-inf requires structured_masking to be enabled (need r_low, r_high, span_blocks)"
+        print("=" * 50)
+        print("  [C-inf] Structured inference ENABLED")
+        print(f"  aggregation={self.cinf_aggregation}")
+        print(f"  commitment={self.cinf_commitment}")
+        print(f"  Reusing C params: r_low={self.sm_r_low}, r_high={self.sm_r_high}, span_blocks={self.sm_span_blocks}")
+        print("=" * 50)
 
     # --- Mechanism A: Span-Level Loss ---
     self.span_loss_enabled = getattr(
@@ -1094,7 +1115,20 @@ class Diffusion(L.LightningModule):
         cond[:, 1:] = self.mask_index
 
     # sample
-    if self.sampler == 'semi_ar':
+    if self.structured_inference:
+      # --- C-inf: 使用 analytic sampler 以获得全局 span 可见性 ---
+      print("[C-inf] Using analytic sampler for structured inference")
+      x_out = self._analytic_sampler(
+        n_samples=x_init.shape[0],
+        num_steps=num_steps,
+        seqlen=seqlen,
+        eps=eps,
+        x_init=x_init,
+        cond=cond,
+        token_mask=token_mask,  # 新增参数
+      )
+
+    elif self.sampler == 'semi_ar':
 
       x_out, _ = self._semi_ar_sampler(
         n_samples=x_init.shape[0],
@@ -1170,7 +1204,7 @@ class Diffusion(L.LightningModule):
     return samples
 
   def get_score(self, x, sigma, cond=None):
-    model_output = self.forward(x, sigma, cond=None).to(torch.float64)
+    model_output = self.forward(x, sigma, cond=cond).to(torch.float64)
     if self.config.sampling.nucleus_p == 1.0:
       return model_output.exp()
     model_output = model_output - model_output.logsumexp(-1, keepdim=True)
@@ -1188,7 +1222,7 @@ class Diffusion(L.LightningModule):
     sigma_t = self._sigma_from_p(self.noise(t)[1])
     sigma_s = self._sigma_from_p(self.noise(t - dt)[1])
     dsigma = sigma_t - sigma_s
-    score = self.get_score(x, sigma_t, cond=None)
+    score = self.get_score(x, sigma_t, cond=cond)
     stag_score = self._staggered_score(score, dsigma)
     probs = stag_score * self._transp_transition(x, dsigma)
     return _sample_categorical(probs)
@@ -1196,7 +1230,7 @@ class Diffusion(L.LightningModule):
 
   def _denoiser_update(self, x, t, cond=None):
     sigma = self._sigma_from_p(self.noise(t)[1])
-    score = self.get_score(x, sigma, cond=None)
+    score = self.get_score(x, sigma, cond=cond)
     stag_score = self._staggered_score(score, sigma)
     probs = stag_score * self._transp_transition(x, sigma)
     probs[..., self.mask_index] = 0
@@ -1553,9 +1587,106 @@ class Diffusion(L.LightningModule):
     entropy[masked_indices] += pos_term - neg_term + const
     return entropy
 
+  def _apply_structured_unmasking(self, x, t, token_mask):
+    """
+    C-inf: 结构化 unmasking 后处理。
+
+    在 _analytic_update 完成标准的 per-token 随机 unmasking 之后，
+    根据 s(t) 对 answer 区域施加 span-level 的一致性约束：
+
+    - s(t) ≈ 1 (高噪声): 按 span 为单位做 unmask 决策。
+      如果一个 span 内 unmask 比例太低（零散的 unmask），
+      将它们撤回（重新 mask），保持 span 粒度的一致性。
+    - s(t) ≈ 0 (低噪声): 不干预，保留原始 per-token 行为。
+    - 中间: 用 s(t) 作为撤回概率的权重，平滑过渡。
+
+    这样做保持了 MDLM 连续时间 Markov chain 的数学基础，
+    只在后处理阶段引入 span-level 的相关性。
+    """
+    B, L = x.shape
+    device = x.device
+    block_size = self.block_size
+    n_blocks = L // block_size
+
+    # t ∈ [eps, 1]，t 越大噪声越高
+    r_t = t.squeeze(-1)  # [B]
+
+    # 计算 s(t) —— 复用训练时 Mechanism C 的同一公式
+    s_t = torch.clamp(
+        (r_t - self.sm_r_low) / (self.sm_r_high - self.sm_r_low + 1e-8),
+        min=0.0, max=1.0
+    )  # [B]
+
+    # s(t) 全部接近 0 时，不做任何干预
+    if s_t.max().item() < 0.05:
+        return x
+
+    span_blocks = max(1, int(self.sm_span_blocks))
+    token_mask_bool = token_mask.bool()
+
+    x_out = x.clone()
+
+    for b in range(B):
+        s = s_t[b].item()
+        if s < 0.05:
+            continue
+
+        # 找到 answer 区域的 block indices
+        noised_blk = token_mask_bool[b].view(n_blocks, block_size)
+        answer_blk_mask = (noised_blk.sum(-1) > 0)  # [n_blocks]
+        ans_blk_ids = torch.where(answer_blk_mask)[0]
+
+        if len(ans_blk_ids) == 0:
+            continue
+
+        n_ans_blocks = len(ans_blk_ids)
+        n_spans = max(1, n_ans_blocks // span_blocks)
+        actual_span_size = n_ans_blocks // n_spans
+
+        for sp_idx in range(n_spans):
+            sp_start = sp_idx * actual_span_size
+            sp_end = (sp_start + actual_span_size) if sp_idx < n_spans - 1 else n_ans_blocks
+            span_blk_ids = ans_blk_ids[sp_start:sp_end]
+
+            # 收集 span 内所有 answer token 的位置
+            span_positions = []
+            for blk_id in span_blk_ids:
+                start_pos = blk_id.item() * block_size
+                end_pos = start_pos + block_size
+                for pos in range(start_pos, end_pos):
+                    if token_mask_bool[b, pos]:
+                        span_positions.append(pos)
+
+            if len(span_positions) == 0:
+                continue
+
+            span_pos = torch.tensor(span_positions, device=device)
+
+            # 检查 span 内 unmask 的比例
+            is_unmasked = (x[b, span_pos] != self.mask_index)
+            unmask_ratio = is_unmasked.float().mean().item()
+
+            if self.cinf_commitment == 'hard':
+                # 硬决策：span 内 unmask > 50% → 全部保留；否则全部撤回
+                if unmask_ratio <= 0.5:
+                    # 撤回零散的 unmask
+                    x_out[b, span_pos[is_unmasked]] = self.mask_index
+                # else: 保留（不额外操作）
+
+            else:  # mixed（默认）
+                # 软约束：unmask 比例很低的 span，以概率 s 撤回零散 unmask
+                if unmask_ratio < 0.3:
+                    revert_prob = s  # 高噪声时撤回概率大
+                    revert_mask = is_unmasked & (
+                        torch.rand(len(span_pos), device=device) < revert_prob
+                    )
+                    x_out[b, span_pos[revert_mask]] = self.mask_index
+
+    return x_out
+    
   @torch.no_grad
   def _analytic_sampler(
-    self, n_samples, num_steps, seqlen, eps=1e-5, x_init=None, cond=None): 
+    self, n_samples, num_steps, seqlen, eps=1e-5, x_init=None, cond=None,token_mask=None): 
     # x = self._sample_prior(
     #   n_samples,
     #   seqlen).to(self.device)
@@ -1569,10 +1700,18 @@ class Diffusion(L.LightningModule):
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
+    # for i in tqdm(range(num_steps), desc='step'):
+    #   t = timesteps[i] * torch.ones(
+    #     x.shape[0], 1, device=self.device)
+    #   x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
     for i in tqdm(range(num_steps), desc='step'):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
+
+      # --- C-inf: structured unmasking post-processing ---
+      if self.structured_inference and token_mask is not None:
+        x = self._apply_structured_unmasking(x, t, token_mask)
     # denoising step 
     t = timesteps[-1] * torch.ones(x.shape[0], 1,
                                   device=self.device)
