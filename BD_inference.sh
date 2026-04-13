@@ -25,6 +25,10 @@ python -u main.py \
   data.train=cnn_dailymail \
   data.valid=cnn_dailymail \
   data.wrap=false \
+  +data.cnn_dm_version=3.0.0 \
+  +data.prefix_max_tokens=768 \
+  +data.answer_max_tokens=256 \
+  +data.loss_on_answer_eos=True \
   wandb=null \
   +data.conditional_generation=true \
   data.cache_dir=/data/lab/yan/peihong_li/data_cache/cdm_cnn_dm_dat \
@@ -41,7 +45,7 @@ python -u main.py \
   algo.span_loss.enabled=False \
   algo.span_loss.lambda_span=1.0 \
   algo.span_loss.type=bow \
-  algo.structured_inference.enabled=True \
+  algo.structured_inference.enabled=False \
   algo.structured_inference.aggregation=mean \
   algo.structured_inference.commitment=mixed \
   algo.structured_inference.threshold=fixed_ratio

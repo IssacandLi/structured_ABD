@@ -147,6 +147,10 @@ def generate_samples(config, logger, tokenizer):
         gts.append(tokenizer.decode(gt_ids))
 
       # pred_i is a list length = batch size
+      # preds.extend(pred_i)
+      if pred_i is None:
+          logger.warning(f"[Batch {b_idx}] Sampling returned None, skipping")
+          continue
       preds.extend(pred_i)
     model.metrics.reset()  # 可选：避免遗留值；更保险
     model.metrics.record_conditional_perplexity(

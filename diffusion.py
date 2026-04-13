@@ -1589,41 +1589,38 @@ class Diffusion(L.LightningModule):
 
   def _apply_structured_unmasking(self, x, t, token_mask):
     """
-    C-inf: 结构化 unmasking 后处理。
+    C-inf: 结构化 unmasking 后处理（修复版）
 
-    在 _analytic_update 完成标准的 per-token 随机 unmasking 之后，
-    根据 s(t) 对 answer 区域施加 span-level 的一致性约束：
+    核心思路：将零散的 unmask 集中到高置信度的 span 中，
+    而不是无差别地撤回所有低占比 span 的 unmask。
 
-    - s(t) ≈ 1 (高噪声): 按 span 为单位做 unmask 决策。
-      如果一个 span 内 unmask 比例太低（零散的 unmask），
-      将它们撤回（重新 mask），保持 span 粒度的一致性。
-    - s(t) ≈ 0 (低噪声): 不干预，保留原始 per-token 行为。
-    - 中间: 用 s(t) 作为撤回概率的权重，平滑过渡。
+    流程：
+    1. 计算每个 span 的 unmask 比例（作为置信度代理）
+    2. 按置信度排序
+    3. 保护排名靠前的 span（不撤回），撤回排名靠后的 span
+    4. 撤回力度由 s(t) 控制：高噪声时更激进，低噪声时不干预
 
-    这样做保持了 MDLM 连续时间 Markov chain 的数学基础，
-    只在后处理阶段引入 span-level 的相关性。
+    效果：unmask token 从分散变为集中，实现 span-level commitment，
+    同时不阻止模型积累有效 unmask。
     """
     B, L = x.shape
     device = x.device
     block_size = self.block_size
     n_blocks = L // block_size
 
-    # t ∈ [eps, 1]，t 越大噪声越高
     r_t = t.squeeze(-1)  # [B]
 
-    # 计算 s(t) —— 复用训练时 Mechanism C 的同一公式
     s_t = torch.clamp(
         (r_t - self.sm_r_low) / (self.sm_r_high - self.sm_r_low + 1e-8),
         min=0.0, max=1.0
     )  # [B]
 
-    # s(t) 全部接近 0 时，不做任何干预
+    # s(t) 太小时不干预
     if s_t.max().item() < 0.05:
         return x
 
     span_blocks = max(1, int(self.sm_span_blocks))
     token_mask_bool = token_mask.bool()
-
     x_out = x.clone()
 
     for b in range(B):
@@ -1631,11 +1628,10 @@ class Diffusion(L.LightningModule):
         if s < 0.05:
             continue
 
-        # 找到 answer 区域的 block indices
+        # 找到 answer 区域的 block
         noised_blk = token_mask_bool[b].view(n_blocks, block_size)
-        answer_blk_mask = (noised_blk.sum(-1) > 0)  # [n_blocks]
+        answer_blk_mask = (noised_blk.sum(-1) > 0)
         ans_blk_ids = torch.where(answer_blk_mask)[0]
-
         if len(ans_blk_ids) == 0:
             continue
 
@@ -1643,44 +1639,61 @@ class Diffusion(L.LightningModule):
         n_spans = max(1, n_ans_blocks // span_blocks)
         actual_span_size = n_ans_blocks // n_spans
 
+        # ---------- 收集每个 span 的信息 ----------
+        span_data = []
         for sp_idx in range(n_spans):
             sp_start = sp_idx * actual_span_size
             sp_end = (sp_start + actual_span_size) if sp_idx < n_spans - 1 else n_ans_blocks
             span_blk_ids = ans_blk_ids[sp_start:sp_end]
 
-            # 收集 span 内所有 answer token 的位置
-            span_positions = []
+            positions = []
             for blk_id in span_blk_ids:
-                start_pos = blk_id.item() * block_size
-                end_pos = start_pos + block_size
-                for pos in range(start_pos, end_pos):
+                st = blk_id.item() * block_size
+                for pos in range(st, st + block_size):
                     if token_mask_bool[b, pos]:
-                        span_positions.append(pos)
+                        positions.append(pos)
 
-            if len(span_positions) == 0:
+            if not positions:
                 continue
 
-            span_pos = torch.tensor(span_positions, device=device)
+            pos_t = torch.tensor(positions, device=device)
+            is_unmasked = (x[b, pos_t] != self.mask_index)
+            ratio = is_unmasked.float().mean().item()
+            span_data.append({
+                'positions': pos_t,
+                'is_unmasked': is_unmasked,
+                'ratio': ratio,
+            })
 
-            # 检查 span 内 unmask 的比例
-            is_unmasked = (x[b, span_pos] != self.mask_index)
-            unmask_ratio = is_unmasked.float().mean().item()
+        # 不足 2 个 span 时无法做比较排序，跳过
+        if len(span_data) < 2:
+            continue
 
-            if self.cinf_commitment == 'hard':
-                # 硬决策：span 内 unmask > 50% → 全部保留；否则全部撤回
-                if unmask_ratio <= 0.5:
-                    # 撤回零散的 unmask
-                    x_out[b, span_pos[is_unmasked]] = self.mask_index
-                # else: 保留（不额外操作）
+        # ---------- 按 unmask 比例降序排列（置信度高的在前） ----------
+        span_data.sort(key=lambda d: d['ratio'], reverse=True)
 
-            else:  # mixed（默认）
-                # 软约束：unmask 比例很低的 span，以概率 s 撤回零散 unmask
-                if unmask_ratio < 0.3:
-                    revert_prob = s  # 高噪声时撤回概率大
-                    revert_mask = is_unmasked & (
-                        torch.rand(len(span_pos), device=device) < revert_prob
-                    )
-                    x_out[b, span_pos[revert_mask]] = self.mask_index
+        # ---------- 决定保护多少 span ----------
+        # s=1（高噪声）: 保护 60% 的 span，撤回 40%
+        # s=0.5:          保护 80%
+        # s→0:            保护 100%（不干预）
+        protect_frac = 1.0 - 0.4 * s
+        n_protect = max(1, int(len(span_data) * protect_frac))
+
+        # ---------- 对未保护的 span 执行软撤回 ----------
+        for rank, sd in enumerate(span_data):
+            if rank < n_protect:
+                # 高置信度 span：保留不动
+                continue
+
+            # 低置信度 span：以概率 (s * 0.5) 撤回其 unmask token
+            # 乘 0.5 是为了避免过度激进
+            unmasked_positions = sd['positions'][sd['is_unmasked']]
+            if len(unmasked_positions) == 0:
+                continue
+
+            revert_prob = s * 0.5
+            revert_mask = torch.rand(len(unmasked_positions), device=device) < revert_prob
+            x_out[b, unmasked_positions[revert_mask]] = self.mask_index
 
     return x_out
     
@@ -1690,37 +1703,46 @@ class Diffusion(L.LightningModule):
     # x = self._sample_prior(
     #   n_samples,
     #   seqlen).to(self.device)
+    # 保存 x_init 用于钉住 prefix（放在 for 循环之前）
+    x_init_device = x_init.to(self.device) if x_init is not None else None
 
-    if x_init is None:
-      x = self._sample_prior(n_samples, seqlen).to(self.device)
-    else:
-      x = x_init.to(self.device)
-
-    x[:, 0] = self.tokenizer.bos_token_id
-    timesteps = torch.linspace(
-      1, eps, num_steps + 1, device=self.device)
-    dt = (1 - eps) / num_steps
-    # for i in tqdm(range(num_steps), desc='step'):
-    #   t = timesteps[i] * torch.ones(
-    #     x.shape[0], 1, device=self.device)
-    #   x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
     for i in tqdm(range(num_steps), desc='step'):
-      t = timesteps[i] * torch.ones(
-        x.shape[0], 1, device=self.device)
-      x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
+        t = timesteps[i] * torch.ones(
+            x.shape[0], 1, device=self.device)
+        x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
 
-      # --- C-inf: structured unmasking post-processing ---
-      if self.structured_inference and token_mask is not None:
-        x = self._apply_structured_unmasking(x, t, token_mask)
-    # denoising step 
+        # ===== 新增：钉住 prefix token =====
+        # token_mask: True = answer 位置, False = prefix 位置
+        # 只保留 answer 区域的采样结果，prefix 恢复为原始值
+        if x_init_device is not None and token_mask is not None:
+            x = torch.where(token_mask, x, x_init_device)
+
+        # --- C-inf: structured unmasking post-processing ---
+        if self.structured_inference and token_mask is not None:
+            x = self._apply_structured_unmasking(x, t, token_mask)
+
+    # denoising step
     t = timesteps[-1] * torch.ones(x.shape[0], 1,
-                                  device=self.device)
+                                    device=self.device)
     x = self._denoiser_update(x=x, t=t, cond=cond)
+
+    # ===== 新增：denoiser 之后也钉住 prefix =====
+    if x_init_device is not None and token_mask is not None:
+        x = torch.where(token_mask, x, x_init_device)
+
+    # ===== 修改：conditional 生成跳过 entropy stop =====
+    # conditional 生成的输出可能合理地低熵（如摘要任务），
+    # 不应因此被判定为退化
+    if token_mask is not None:
+        # conditional 模式：不做 stop 检查，直接返回
+        return x
+    else:
+        stop, x = self._check_stop_conds(x)
+        if stop:
+            return None
+        return x
+
     
-    stop, x = self._check_stop_conds(x)
-    if stop:
-      return None
-    return x
 
   @torch.no_grad()
   def _semi_ar_sampler(
