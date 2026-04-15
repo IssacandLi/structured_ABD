@@ -1152,9 +1152,13 @@ class Diffusion(L.LightningModule):
     if self.ema:
       self.ema.restore(self._get_parameters())
 
+    # if x_out is None:
+    #   print("[DEBUG] x_out is None - sampling failed due to stop conditions")
+    #   return None
     if x_out is None:
       print("[DEBUG] x_out is None - sampling failed due to stop conditions")
-      return None
+      print("[DEBUG] Retrying without stop conditions is not implemented; returning empty strings")
+      return [""] * batch['input_ids'].shape[0]
     print(f"[DEBUG] x_out shape: {x_out.shape}")
     print(f"[DEBUG] x_out sample (first 50): {x_out[0, :50].tolist()}")
     print(f"[DEBUG] x_out sample (last 50): {x_out[0, -50:].tolist()}")
@@ -1703,6 +1707,15 @@ class Diffusion(L.LightningModule):
     # x = self._sample_prior(
     #   n_samples,
     #   seqlen).to(self.device)
+    if x_init is None:
+        x = self._sample_prior(n_samples, seqlen).to(self.device)
+    else:
+        x = x_init.to(self.device)
+
+    x[:, 0] = self.tokenizer.bos_token_id
+    timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)   # ← 这行必须在这里
+    dt = (1 - eps) / num_steps
+
     # 保存 x_init 用于钉住 prefix（放在 for 循环之前）
     x_init_device = x_init.to(self.device) if x_init is not None else None
 
@@ -1862,12 +1875,18 @@ class Diffusion(L.LightningModule):
               x_accum[:, fwd_idx] = x_next
 
           # 3) 可选：variable-length / stop 条件（保留原逻辑，但修掉 x 未定义的问题）
-          if x_accum.shape[1] > 256:
-              stop, x_accum = self._check_stop_conds(x_accum)
-              if stop and (not getattr(self.config.sampling, "var_length", False)):
-                  return None, None
-              elif stop:
-                  break
+          # if x_accum.shape[1] > 256:
+          #     stop, x_accum = self._check_stop_conds(x_accum)
+          #     if stop and (not getattr(self.config.sampling, "var_length", False)):
+          #         return None, None
+          #     elif stop:
+          #         break
+          if x_accum.shape[1] > 256 and x_init is None:
+            stop, x_accum = self._check_stop_conds(x_accum)
+            if stop and (not getattr(self.config.sampling, "var_length", False)):
+                return None, None
+            elif stop:
+                break
 
       return x_accum, sampling_steps
 
