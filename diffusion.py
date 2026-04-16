@@ -1640,25 +1640,38 @@ class Diffusion(L.LightningModule):
 
     return x_out
 
-  def _span_correlated_sample(self, probs, x, t, token_mask):
+  def _span_correlated_sample(self, probs, x, t, token_mask, num_steps):
     """
-    C-inf: Span-level 整体 unmask。
-    
+    C-inf: Span-level 整体 unmask（策略 A：per-step fixed reveal budget + 单调性钉住）。
+
     核心逻辑：
-    1. 对每个 span 计算 span 级别的平均置信度
-    2. 置信度超过阈值的 span → 整体采样 unmask（span 内所有 masked token 都从 probs 采样）
-    3. 置信度低于阈值的 span → 整体保持 MASK（本步不动）
-    4. 已经 unmask 的 token 永远不动（单调性）
-    
-    s(t) 控制粒度：
-    - s≈1 (高噪声): 严格 span 级，只有少数最有信心的 span 被 unmask
-    - s≈0 (低噪声): 退化为标准 per-token 采样
+    1. 对每个"还有 masked token"的 span 计算平均置信度
+    2. 按 "每步 reveal 预算 × (1.5 - s)" 决定本步 unmask 几个 span
+       - 高噪声（s≈1）→ 乘 0.5，reveal 少
+       - 低噪声（s≈0）→ 乘 1.5，reveal 多
+    3. 被选中的 span：其所有 masked token 用本步采样结果 unmask
+    4. 未被选中的 span：本步保持 MASK（下一步再考虑）
+    5. 已经 unmask 的 answer token：强制钉住原值（单调性）
+
+    Args:
+        probs:      [B, L, V]  transition probabilities from analytic sampler
+        x:          [B, L]      current token sequence (含已 unmask 的 answer token)
+        t:          [B, 1]      current timestep
+        token_mask: [B, L]      True = answer 区域，False = prefix
+        num_steps:  int         总采样步数（用于算 per-step reveal 预算）
     """
     B, L, V = probs.shape
     device = probs.device
 
-    # 标准独立采样（作为候选）
+    # 标准独立采样（作为候选值）
     samples = _sample_categorical(probs)
+
+    # ===== P0 修复（单调性）=====
+    # 所有已经 unmask 的 answer token 必须保留原值，不能被重新采样
+    # 必须在函数最开头就先做一次，保证即使下面 early-return 也安全
+    token_mask_bool = token_mask.bool()
+    already_unmasked = (x != self.mask_index) & token_mask_bool
+    samples = torch.where(already_unmasked, x, samples)
 
     # 计算 s(t)
     r_t = t.squeeze(-1)
@@ -1667,13 +1680,13 @@ class Diffusion(L.LightningModule):
         min=0.0, max=1.0
     )
 
+    # s(t) 太小：退化为独立采样（但单调性已钉住）
     if s_t.max().item() < 0.05:
         return samples
 
     block_size = self.block_size
     n_blocks = L // block_size
     span_blocks = max(1, int(self.sm_span_blocks))
-    token_mask_bool = token_mask.bool()
 
     for b in range(B):
         s = s_t[b].item()
@@ -1690,7 +1703,7 @@ class Diffusion(L.LightningModule):
         n_spans = max(1, n_ans_blocks // span_blocks)
         actual_span_size = n_ans_blocks // n_spans
 
-        # ---------- 收集每个 span 的置信度 ----------
+        # ---------- 收集每个 span 的 (masked 位置, 置信度) ----------
         span_info = []
         for sp_idx in range(n_spans):
             sp_start = sp_idx * actual_span_size
@@ -1705,40 +1718,49 @@ class Diffusion(L.LightningModule):
                         masked_positions.append(pos)
 
             if len(masked_positions) == 0:
-                span_info.append(None)  # span 已经完全 unmask
+                span_info.append(None)  # span 已完全 unmask，跳过
                 continue
 
             pos_tensor = torch.tensor(masked_positions, device=device)
-            # span 置信度 = span 内 masked token 的平均 (1 - p(mask))
             avg_conf = (1.0 - probs[b, pos_tensor, self.mask_index]).mean().item()
-            
             span_info.append({
                 'pos_tensor': pos_tensor,
                 'confidence': avg_conf,
             })
 
-        # ---------- 按置信度排序，决定哪些 span 本步整体 unmask ----------
         valid_spans = [(i, si) for i, si in enumerate(span_info) if si is not None]
         if len(valid_spans) == 0:
             continue
 
-        valid_spans.sort(key=lambda x: x[1]['confidence'], reverse=True)
+        valid_spans.sort(key=lambda kv: kv[1]['confidence'], reverse=True)
 
-        # s 控制每步 unmask 多少个 span：
-        # s≈1: 每步只 unmask 1个最有信心的 span（最保守，coarse 粒度）
-        # s≈0: 所有 span 都 unmask（退化为标准采样）
-        n_valid = len(valid_spans)
-        # 每步 unmask 的 span 数量：至少 1 个，s 越小越多
-        n_unmask = max(1, int(n_valid * (1.0 - s * 0.7)))
+        # ===== 策略 A：per-step fixed reveal budget =====
+        # 本 batch 样本的 answer 区总 token 数
+        total_answer_tokens = int(token_mask_bool[b].sum().item())
+        # 每步均摊的 reveal token 数
+        per_step_budget_tokens = max(1, total_answer_tokens // max(1, num_steps))
+        # 噪声依赖缩放：s=1 → 0.5x（高噪声 reveal 少）；s=0 → 1.5x（低噪声 reveal 多）
+        step_multiplier = 1.5 - s
+        reveal_budget_tokens = max(block_size, int(per_step_budget_tokens * step_multiplier))
 
+        # 换算成 span 数（每个 span 多少 token）
+        tokens_per_span = actual_span_size * block_size
+        n_unmask = max(1, reveal_budget_tokens // max(1, tokens_per_span))
+        n_unmask = min(n_unmask, len(valid_spans))
+
+        # ---------- 执行 span 级 gating ----------
         for rank, (sp_idx, si) in enumerate(valid_spans):
             pos_tensor = si['pos_tensor']
             if rank < n_unmask:
-                # 这个 span 本步整体 unmask：保留独立采样结果
-                pass  # samples 里已经是采样结果了，不需要操作
+                # 被选中 reveal：保留 samples 里的采样结果（已钉住的不受影响）
+                pass
             else:
-                # 这个 span 本步整体保持 MASK：覆盖为 mask_index
+                # 未选中：本步保持 MASK
                 samples[b, pos_tensor] = self.mask_index
+    # DEBUG: 验证单调性没破
+    _violations = (token_mask_bool & (x != self.mask_index) & (samples != x)).sum().item()
+    if _violations > 0:
+        print(f"[C-inf WARNING] 单调性违反 {_violations} 个 token!")
 
     return samples
     
@@ -1760,20 +1782,7 @@ class Diffusion(L.LightningModule):
     # 保存 x_init 用于钉住 prefix（放在 for 循环之前）
     x_init_device = x_init.to(self.device) if x_init is not None else None
 
-    # for i in tqdm(range(num_steps), desc='step'):
-    #     t = timesteps[i] * torch.ones(
-    #         x.shape[0], 1, device=self.device)
-    #     x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
 
-    #     # ===== 新增：钉住 prefix token =====
-    #     # token_mask: True = answer 位置, False = prefix 位置
-    #     # 只保留 answer 区域的采样结果，prefix 恢复为原始值
-    #     if x_init_device is not None and token_mask is not None:
-    #         x = torch.where(token_mask, x, x_init_device)
-
-    #     # --- C-inf: structured unmasking post-processing ---
-    #     if self.structured_inference and token_mask is not None:
-    #         x = self._apply_structured_unmasking(x, t, token_mask)
     for i in tqdm(range(num_steps), desc='step'):
       t = timesteps[i] * torch.ones(
           x.shape[0], 1, device=self.device)
@@ -1787,22 +1796,27 @@ class Diffusion(L.LightningModule):
           score = self.get_score(x, sigma_t, cond=cond)
           stag_score = self._staggered_score(score, dsigma)
           probs = stag_score * self._transp_transition(x, dsigma)
-          x = self._span_correlated_sample(probs, x, t, token_mask)
+          x = self._span_correlated_sample(probs, x, t, token_mask, num_steps)
       else:
           x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
 
-    # ===== 钉住 prefix token =====
-    if x_init_device is not None and token_mask is not None:
-        x = torch.where(token_mask, x, x_init_device)
 
-    # 注意：这里不再调用 _apply_structured_unmasking
-
+    #     x = torch.where(token_mask, x, x_init_device)
     # denoising step
-    t = timesteps[-1] * torch.ones(x.shape[0], 1,
-                                    device=self.device)
+    t = timesteps[-1] * torch.ones(x.shape[0], 1, device=self.device)
+
+    # ===== P0 修复：denoiser 前记录已 unmask 的 answer 位置 =====
+    if token_mask is not None:
+        answer_already_unmasked = (x != self.mask_index) & token_mask.bool()
+        x_before_denoiser = x.clone()
+
     x = self._denoiser_update(x=x, t=t, cond=cond)
 
-    # ===== 新增：denoiser 之后也钉住 prefix =====
+    # ===== P0 修复：denoiser 之后，answer 区已 unmask 的钉回原值 =====
+    if token_mask is not None:
+        x = torch.where(answer_already_unmasked, x_before_denoiser, x)
+
+    # ===== 钉住 prefix =====
     if x_init_device is not None and token_mask is not None:
         x = torch.where(token_mask, x, x_init_device)
 
