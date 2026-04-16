@@ -45,7 +45,7 @@ python -u main.py \
   algo.span_loss.enabled=False \
   algo.span_loss.lambda_span=1.0 \
   algo.span_loss.type=bow \
-  algo.structured_inference.enabled=False \
+  algo.structured_inference.enabled=True \
   algo.structured_inference.aggregation=mean \
   algo.structured_inference.commitment=mixed \
   algo.structured_inference.threshold=fixed_ratio

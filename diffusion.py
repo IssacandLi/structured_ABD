@@ -540,67 +540,6 @@ class Diffusion(L.LightningModule):
                       'monitor': 'val/loss',
                       'name': 'trainer/lr'}
     return [optimizer], [scheduler_dict]
-  
-  #unconditional block diffusion
-  # def _resample_q_xt(
-  #     self, x, xt, move_indices, p, block_size, sampling_eps_min, sampling_eps_max,
-  #     noised_mask=None):
-  #   noised_mask = noised_mask.to(dtype=torch.bool)
-
-  #   # reshape to blocks
-  #   x_blk  = x.reshape(x.shape[0], -1, block_size)
-  #   xt_blk = xt.reshape(xt.shape[0], -1, block_size)
-  #   m_blk  = noised_mask.reshape(noised_mask.shape[0], -1, block_size)
-
-  #   # blocks that actually have any eligible/noised token
-  #   active_blk = (m_blk.sum(-1) > 0)  # [B, n_blocks]
-
-  #   def masked_ratio(xt_blk_local):
-  #     # numerator: masked & eligible
-  #     num = ((xt_blk_local == self.mask_index) & m_blk).float().sum(-1)  # [B, n_blocks]
-  #     # denominator: eligible count (avoid /0; inactive blocks won't be resampled anyway)
-  #     den = m_blk.float().sum(-1).clamp(min=1.0)
-  #     return num / den
-
-  #   perc_masked = masked_ratio(xt_blk)
-
-  #   # only consider active blocks for resampling condition
-  #   def need_resample(pm):
-  #     too_low  = (pm < sampling_eps_min) & active_blk
-  #     too_high = (pm > sampling_eps_max) & active_blk
-  #     return too_low.any() or too_high.any()
-
-  #   while need_resample(perc_masked):
-  #     # if a bound is epsilon, don't resample the other side (keep original behavior)
-  #     if sampling_eps_min == 1e-3 and sampling_eps_max != 1:
-  #       regen_blk = (perc_masked > sampling_eps_max) & active_blk
-  #       if regen_blk.max() == 0:
-  #         break
-  #     elif sampling_eps_min != 1e-3 and sampling_eps_max == 1:
-  #       regen_blk = (perc_masked < sampling_eps_min) & active_blk
-  #       if regen_blk.max() == 0:
-  #         break
-  #     elif sampling_eps_min != 1e-3 and sampling_eps_max != 1:
-  #       regen_blk = ((perc_masked < sampling_eps_min) | (perc_masked > sampling_eps_max)) & active_blk
-  #     else:
-  #       # bounds are [1e-3, 1] => should have been skipped outside, but safe fallback
-  #       break
-
-  #     # expand block-level mask -> token-level mask, and AND with noised_mask
-  #     regen_tok = regen_blk.repeat_interleave(block_size, dim=-1)  # [B, L]
-  #     regen_tok = regen_tok & noised_mask                          # only eligible positions
-
-  #     # re-sample move_indices ONLY on those tokens
-  #     move_indices[regen_tok] = (torch.rand(*x.shape, device=x.device) < p)[regen_tok]
-
-  #     # recompute xt and perc_masked
-  #     xt = torch.where(move_indices, self.mask_index, x)
-  #     xt_blk = xt.reshape(xt.shape[0], -1, block_size)
-  #     perc_masked = masked_ratio(xt_blk)
-
-  #   return xt.reshape(xt.shape[0], -1, block_size)
-
-
 
   def _resample_q_xt(
     self,
@@ -1700,6 +1639,108 @@ class Diffusion(L.LightningModule):
             x_out[b, unmasked_positions[revert_mask]] = self.mask_index
 
     return x_out
+
+  def _span_correlated_sample(self, probs, x, t, token_mask):
+    """
+    C-inf: Span-level 整体 unmask。
+    
+    核心逻辑：
+    1. 对每个 span 计算 span 级别的平均置信度
+    2. 置信度超过阈值的 span → 整体采样 unmask（span 内所有 masked token 都从 probs 采样）
+    3. 置信度低于阈值的 span → 整体保持 MASK（本步不动）
+    4. 已经 unmask 的 token 永远不动（单调性）
+    
+    s(t) 控制粒度：
+    - s≈1 (高噪声): 严格 span 级，只有少数最有信心的 span 被 unmask
+    - s≈0 (低噪声): 退化为标准 per-token 采样
+    """
+    B, L, V = probs.shape
+    device = probs.device
+
+    # 标准独立采样（作为候选）
+    samples = _sample_categorical(probs)
+
+    # 计算 s(t)
+    r_t = t.squeeze(-1)
+    s_t = torch.clamp(
+        (r_t - self.sm_r_low) / (self.sm_r_high - self.sm_r_low + 1e-8),
+        min=0.0, max=1.0
+    )
+
+    if s_t.max().item() < 0.05:
+        return samples
+
+    block_size = self.block_size
+    n_blocks = L // block_size
+    span_blocks = max(1, int(self.sm_span_blocks))
+    token_mask_bool = token_mask.bool()
+
+    for b in range(B):
+        s = s_t[b].item()
+        if s < 0.05:
+            continue
+
+        noised_blk = token_mask_bool[b].view(n_blocks, block_size)
+        answer_blk_mask = (noised_blk.sum(-1) > 0)
+        ans_blk_ids = torch.where(answer_blk_mask)[0]
+        if len(ans_blk_ids) == 0:
+            continue
+
+        n_ans_blocks = len(ans_blk_ids)
+        n_spans = max(1, n_ans_blocks // span_blocks)
+        actual_span_size = n_ans_blocks // n_spans
+
+        # ---------- 收集每个 span 的置信度 ----------
+        span_info = []
+        for sp_idx in range(n_spans):
+            sp_start = sp_idx * actual_span_size
+            sp_end = (sp_start + actual_span_size) if sp_idx < n_spans - 1 else n_ans_blocks
+            span_blk_ids = ans_blk_ids[sp_start:sp_end]
+
+            masked_positions = []
+            for blk_id in span_blk_ids:
+                st = blk_id.item() * block_size
+                for pos in range(st, st + block_size):
+                    if x[b, pos] == self.mask_index:
+                        masked_positions.append(pos)
+
+            if len(masked_positions) == 0:
+                span_info.append(None)  # span 已经完全 unmask
+                continue
+
+            pos_tensor = torch.tensor(masked_positions, device=device)
+            # span 置信度 = span 内 masked token 的平均 (1 - p(mask))
+            avg_conf = (1.0 - probs[b, pos_tensor, self.mask_index]).mean().item()
+            
+            span_info.append({
+                'pos_tensor': pos_tensor,
+                'confidence': avg_conf,
+            })
+
+        # ---------- 按置信度排序，决定哪些 span 本步整体 unmask ----------
+        valid_spans = [(i, si) for i, si in enumerate(span_info) if si is not None]
+        if len(valid_spans) == 0:
+            continue
+
+        valid_spans.sort(key=lambda x: x[1]['confidence'], reverse=True)
+
+        # s 控制每步 unmask 多少个 span：
+        # s≈1: 每步只 unmask 1个最有信心的 span（最保守，coarse 粒度）
+        # s≈0: 所有 span 都 unmask（退化为标准采样）
+        n_valid = len(valid_spans)
+        # 每步 unmask 的 span 数量：至少 1 个，s 越小越多
+        n_unmask = max(1, int(n_valid * (1.0 - s * 0.7)))
+
+        for rank, (sp_idx, si) in enumerate(valid_spans):
+            pos_tensor = si['pos_tensor']
+            if rank < n_unmask:
+                # 这个 span 本步整体 unmask：保留独立采样结果
+                pass  # samples 里已经是采样结果了，不需要操作
+            else:
+                # 这个 span 本步整体保持 MASK：覆盖为 mask_index
+                samples[b, pos_tensor] = self.mask_index
+
+    return samples
     
   @torch.no_grad
   def _analytic_sampler(
@@ -1719,20 +1760,42 @@ class Diffusion(L.LightningModule):
     # 保存 x_init 用于钉住 prefix（放在 for 循环之前）
     x_init_device = x_init.to(self.device) if x_init is not None else None
 
+    # for i in tqdm(range(num_steps), desc='step'):
+    #     t = timesteps[i] * torch.ones(
+    #         x.shape[0], 1, device=self.device)
+    #     x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
+
+    #     # ===== 新增：钉住 prefix token =====
+    #     # token_mask: True = answer 位置, False = prefix 位置
+    #     # 只保留 answer 区域的采样结果，prefix 恢复为原始值
+    #     if x_init_device is not None and token_mask is not None:
+    #         x = torch.where(token_mask, x, x_init_device)
+
+    #     # --- C-inf: structured unmasking post-processing ---
+    #     if self.structured_inference and token_mask is not None:
+    #         x = self._apply_structured_unmasking(x, t, token_mask)
     for i in tqdm(range(num_steps), desc='step'):
-        t = timesteps[i] * torch.ones(
-            x.shape[0], 1, device=self.device)
-        x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
+      t = timesteps[i] * torch.ones(
+          x.shape[0], 1, device=self.device)
 
-        # ===== 新增：钉住 prefix token =====
-        # token_mask: True = answer 位置, False = prefix 位置
-        # 只保留 answer 区域的采样结果，prefix 恢复为原始值
-        if x_init_device is not None and token_mask is not None:
-            x = torch.where(token_mask, x, x_init_device)
+      # --- C-inf: 用 span-correlated sampling 替代标准采样 + 后处理撤回 ---
+      if self.structured_inference and token_mask is not None:
+          # 分两步：先算概率，再 span 相关采样
+          sigma_t = self._sigma_from_p(self.noise(t)[1])
+          sigma_s = self._sigma_from_p(self.noise(t - dt)[1])
+          dsigma = sigma_t - sigma_s
+          score = self.get_score(x, sigma_t, cond=cond)
+          stag_score = self._staggered_score(score, dsigma)
+          probs = stag_score * self._transp_transition(x, dsigma)
+          x = self._span_correlated_sample(probs, x, t, token_mask)
+      else:
+          x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
 
-        # --- C-inf: structured unmasking post-processing ---
-        if self.structured_inference and token_mask is not None:
-            x = self._apply_structured_unmasking(x, t, token_mask)
+    # ===== 钉住 prefix token =====
+    if x_init_device is not None and token_mask is not None:
+        x = torch.where(token_mask, x, x_init_device)
+
+    # 注意：这里不再调用 _apply_structured_unmasking
 
     # denoising step
     t = timesteps[-1] * torch.ones(x.shape[0], 1,
