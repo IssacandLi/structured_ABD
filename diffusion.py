@@ -69,6 +69,24 @@ class Diffusion(L.LightningModule):
       self.block_size = self.config.model.length
     if self.parameterization == 'ar':
       self.block_size = 1
+
+    # --- Mechanism C: Structured Masking ---
+    self.structured_masking = getattr(
+        getattr(self.config.algo, 'structured_masking', None), 'enabled', False)
+    if self.structured_masking:
+        self.sm_r_low = self.config.algo.structured_masking.r_low
+        self.sm_r_high = self.config.algo.structured_masking.r_high
+        self.sm_b_max_tokens = getattr(
+            self.config.algo.structured_masking, 'b_max_tokens', 32)
+        self.sm_global_t = self.config.algo.structured_masking.global_t
+        self.sm_full_bidir = getattr(
+            self.config.algo.structured_masking, 'full_bidir_attention', False)
+        print("=" * 50)
+        print("  [Mechanism C] Structured masking ENABLED (token-level)")
+        print(f"  r_low={self.sm_r_low}, r_high={self.sm_r_high}, B_max={self.sm_b_max_tokens}")
+        print(f"  full_bidir_attention={self.sm_full_bidir}")
+        print("=" * 50)
+
     if self.config.algo.backbone == 'dit':
       self.backbone = models.dit.DIT(
         self.config, vocab_size=self.vocab_size)
@@ -90,6 +108,16 @@ class Diffusion(L.LightningModule):
         self.backbone.backbone.gen_mask(self.config.model.length, self.block_size, attn_backend='sdpa')
     else:
       raise ValueError(f'Unknown backbone: {self.config.algo.backbone}')
+
+    # 如果启用全双向 mask，覆盖默认的 block_diff_mask
+    if self.structured_masking and getattr(self, 'sm_full_bidir', False):
+        if hasattr(self.backbone, 'gen_mask'):
+            self.backbone.gen_mask(
+                seqlen=self.config.model.length,
+                block_size=self.config.block_size,  # 传但被忽略
+                attn_backend=self.config.model.attn_backend,
+                full_bidir=True,
+            )
 
     self.T = self.config.algo.T
     self.num_tokens = self.config.model.length
@@ -113,19 +141,7 @@ class Diffusion(L.LightningModule):
       
     self.time_conditioning = self.config.algo.time_conditioning
     self.neg_infinity = -1000000.0
-    # --- Mechanism C: Structured Masking ---
-    self.structured_masking = getattr(
-        getattr(self.config.algo, 'structured_masking', None), 'enabled', False)
-    if self.structured_masking:
-        self.sm_r_low = self.config.algo.structured_masking.r_low
-        self.sm_r_high = self.config.algo.structured_masking.r_high
-        self.sm_span_blocks = self.config.algo.structured_masking.span_blocks
-        self.sm_global_t = self.config.algo.structured_masking.global_t
-        print("=" * 50)
-        print("  [Mechanism C+A] Structured masking ENABLED")
-        print(f"  r_low={self.sm_r_low}, r_high={self.sm_r_high}, span_blocks={self.sm_span_blocks}")
-        print("  This is NOT vanilla Block Diffusion.")
-        print("=" * 50) 
+  
     # --- C-inf: Structured Unmasking at Inference ---
     self.structured_inference = getattr(
         getattr(self.config.algo, 'structured_inference', None), 'enabled', False)
@@ -699,100 +715,60 @@ class Diffusion(L.LightningModule):
 
   def _structured_mask(self, x, p, block_size, noised_mask):
     """
-    Mechanism C: 噪声依赖的结构化 masking。
-    
-    - 高噪声 (s(t)≈1): 以 span（多个连续 block）为单位做 mask/保留决策
-    - 低噪声 (s(t)≈0): 标准 per-token 随机 mask
-    - 中间: 平滑过渡
-    
-    span 边界对齐 block 边界，兼容 BD3-LM 的注意力掩码。
+    Mechanism C (文档 §3.4 Step 1 严格实现)：
+    - span 按 token 切分，与 block_size 完全无关
+    - span_size = 1 + s(t) * (B_max - 1)，随噪声线性增长
+    - 高噪声纯 span mask，低噪声近似 token mask
     """
     B, L = x.shape
     device = x.device
-    n_blocks = L // block_size
 
-    # p 的形状是 [B, L] 或 [B, 1]，取每个样本的 mask 概率
+    # r_t = 当前 move_chance（noise schedule 给出）
     if p.dim() == 2:
-        r_t = p[:, 0]  # [B]，每个样本的 masking ratio
+        r_t = p[:, 0]  # [B]
     else:
-        r_t = p  # scalar
+        r_t = p.expand(B) if p.dim() == 0 else p
 
-    # 计算结构化程度 s(t)
     s_t = torch.clamp(
         (r_t - self.sm_r_low) / (self.sm_r_high - self.sm_r_low + 1e-8),
         min=0.0, max=1.0
-    )  # [B]
+    )
 
-    # span 大小（以 block 数量计）
-    span_blocks = max(1, int(self.sm_span_blocks))
-    # 确保 span_blocks 不超过 answer 区域的 block 数
-    # 计算每个样本 answer 区域有多少 block
-    noised_blk = noised_mask.view(B, n_blocks, block_size)
-    answer_blk_mask = (noised_blk.sum(-1) > 0)  # [B, n_blocks], True = 这个 block 有 answer token
-
-    # 对每个样本独立处理
+    B_max = int(self.sm_b_max_tokens)
     xt = x.clone()
-    
-    for b in range(B):
-        s = s_t[b].item() if s_t.dim() > 0 else s_t.item()
-        r = r_t[b].item() if r_t.dim() > 0 else r_t.item()
-        
-        # 找到 answer 区域的 block indices
-        ans_blk_ids = torch.where(answer_blk_mask[b])[0]
-        if len(ans_blk_ids) == 0:
-            continue
-        n_ans_blocks = len(ans_blk_ids)
 
-        if s > 0.01:  # 有结构化成分
-            # 把 answer blocks 分成 span 组
-            n_spans = max(1, n_ans_blocks // span_blocks)
-            actual_span_size = n_ans_blocks // n_spans  # 每 span 多少个 block
-            
-            # 对每个 span 做整体 mask/保留决策
-            span_mask_decisions = (torch.rand(n_spans, device=device) < r)
-            
-            for sp_idx in range(n_spans):
-                sp_start = sp_idx * actual_span_size
-                sp_end = sp_start + actual_span_size if sp_idx < n_spans - 1 else n_ans_blocks
-                span_blk_ids = ans_blk_ids[sp_start:sp_end]
-                
-                if span_mask_decisions[sp_idx]:
-                    # 整个 span 被 mask
-                    for blk_id in span_blk_ids:
-                        blk_start = blk_id * block_size
-                        blk_end = blk_start + block_size
-                        eligible = noised_mask[b, blk_start:blk_end]
-                        
-                        if s < 1.0:
-                            # 部分 span 内 token 随机揭示（平滑过渡）
-                            unmask_prob = 1.0 - s
-                            keep_mask = (torch.rand(block_size, device=device) < unmask_prob) & eligible
-                            mask_positions = eligible & (~keep_mask)
-                        else:
-                            mask_positions = eligible
-                        
-                        xt[b, blk_start:blk_end] = torch.where(
-                            mask_positions, self.mask_index, x[b, blk_start:blk_end])
+    for b in range(B):
+        s = s_t[b].item()
+        r = r_t[b].item()
+
+        # answer 区域的 token 位置
+        ans_token_ids = torch.where(noised_mask[b])[0]
+        n_ans = len(ans_token_ids)
+        if n_ans == 0:
+            continue
+
+        # noise-dependent span size
+        span_size = max(1, int(round(1 + s * (B_max - 1))))
+        n_spans = max(1, n_ans // span_size)
+
+        # 每个 span 以概率 r 整体被 mask
+        span_mask_decisions = (torch.rand(n_spans, device=device) < r)
+
+        for sp_idx in range(n_spans):
+            sp_start = sp_idx * span_size
+            sp_end = min(sp_start + span_size, n_ans) if sp_idx < n_spans - 1 else n_ans
+            span_token_ids = ans_token_ids[sp_start:sp_end]
+
+            if span_mask_decisions[sp_idx]:
+                if s < 1.0:
+                    # span 内以概率 (1-s) 个别保留
+                    keep = torch.rand(len(span_token_ids), device=device) < (1.0 - s)
+                    to_mask = span_token_ids[~keep]
                 else:
-                    # 整个 span 保留（不 mask）
-                    pass  # xt 已经 = x.clone()，不需要操作
-        
-        if s < 0.99:  # 有 token 级成分
-            # 对于非结构化部分，在还没被结构化 mask 处理的位置做随机 token mask
-            # 这确保总 mask ratio 接近 r_t
-            for blk_id in ans_blk_ids:
-                blk_start = blk_id * block_size
-                blk_end = blk_start + block_size
-                eligible = noised_mask[b, blk_start:blk_end]
-                already_masked = (xt[b, blk_start:blk_end] == self.mask_index)
-                not_yet_decided = eligible & (~already_masked)
-                
-                if not_yet_decided.any():
-                    # 用 (1-s) 的权重做额外的随机 token mask
-                    token_mask_prob = r * (1 - s)
-                    additional_mask = (torch.rand(block_size, device=device) < token_mask_prob) & not_yet_decided
-                    xt[b, blk_start:blk_end] = torch.where(
-                        additional_mask, self.mask_index, xt[b, blk_start:blk_end])
+                    to_mask = span_token_ids
+                if len(to_mask) > 0:
+                    xt[b, to_mask] = self.mask_index
+            # else: 整个 span 保留，xt 已经 = x.clone() 不动
 
     return xt
 
@@ -816,53 +792,109 @@ class Diffusion(L.LightningModule):
     p_x0[:, -self.block_size:] = p_x0_
     return p_x0
 
+  # @torch.no_grad()
+  # def _ddpm_caching_update(self, x, t, dt, p_x0=None, cond=None):
+  #   _, move_chance_t = self.noise(t)
+  #   _, move_chance_s = self.noise(t - dt)
+  #   sigma_t = self._sigma_from_p(move_chance_t)
+  #   move_chance_t = move_chance_t[:, None]
+  #   move_chance_s = move_chance_s[:, None]
+  #   mask_prob = move_chance_s / move_chance_t
+
+  #   if p_x0 is None:
+  #     if self.config.sampling.kv_cache:
+  #       p_x0 = self.forward(x[:, -self.block_size:],
+  #                       sigma_t,
+  #                       cond=cond,
+  #                       sample_mode=True).to(torch.float64)
+  #     else:   
+  #       p_x0 = self.forward(x,
+  #                         sigma_t,cond=cond,
+  #                         sample_mode=True).to(torch.float64)
+  #       p_x0 = p_x0[:, -self.block_size:]
+  #     p_x0 = p_x0.exp()
+  #     p_x0 = self._nucleus_sample(p_x0)
+
+  #   if self.config.sampling.first_hitting:
+  #     x_block = _sample_categorical(p_x0)
+  #     # randomly and uniformly select an index in the block (among masked tokens)
+  #     num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
+  #     ind = torch.randint(0, num_masked, (x_block.shape[0],))
+  #     ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
+  #     mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
+  #     x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
+  #   else:
+  #     q_xs = p_x0 * (1 - mask_prob)
+  #     q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
+  #     x_block = _sample_categorical(q_xs)
+  #   copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
+  #   x_block =  copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
+  #   x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
+
+  #   # compute kv cache if all tokens in a block are sampled
+  #   if self.config.sampling.kv_cache and self.mask_index not in x_block:
+  #     _ = self.forward(x_block, sigma_t, cond=cond,sample_mode=True, store_kv=True)
+
+  #   if not torch.allclose(x_new, x):
+  #     return None, x_new
+  #   else:
+  #     return p_x0, x_new
   @torch.no_grad()
-  def _ddpm_caching_update(self, x, t, dt, p_x0=None, cond=None):
-    _, move_chance_t = self.noise(t)
-    _, move_chance_s = self.noise(t - dt)
-    sigma_t = self._sigma_from_p(move_chance_t)
-    move_chance_t = move_chance_t[:, None]
-    move_chance_s = move_chance_s[:, None]
-    mask_prob = move_chance_s / move_chance_t
+  def _ddpm_caching_update(self, x, t, dt, p_x0=None, cond=None,
+                           cinf_token_mask=None, cinf_num_steps=None):
+      _, move_chance_t = self.noise(t)
+      _, move_chance_s = self.noise(t - dt)
+      sigma_t = self._sigma_from_p(move_chance_t)
+      move_chance_t = move_chance_t[:, None]
+      move_chance_s = move_chance_s[:, None]
+      mask_prob = move_chance_s / move_chance_t
 
-    if p_x0 is None:
-      if self.config.sampling.kv_cache:
-        p_x0 = self.forward(x[:, -self.block_size:],
-                        sigma_t,
-                        cond=cond,
-                        sample_mode=True).to(torch.float64)
-      else:   
-        p_x0 = self.forward(x,
-                          sigma_t,cond=cond,
-                          sample_mode=True).to(torch.float64)
-        p_x0 = p_x0[:, -self.block_size:]
-      p_x0 = p_x0.exp()
-      p_x0 = self._nucleus_sample(p_x0)
+      if p_x0 is None:
+          if self.config.sampling.kv_cache:
+              p_x0 = self.forward(x[:, -self.block_size:],
+                                  sigma_t, cond=cond, sample_mode=True).to(torch.float64)
+          else:
+              p_x0 = self.forward(x, sigma_t, cond=cond, sample_mode=True).to(torch.float64)
+              p_x0 = p_x0[:, -self.block_size:]
+          p_x0 = p_x0.exp()
+          p_x0 = self._nucleus_sample(p_x0)
 
-    if self.config.sampling.first_hitting:
-      x_block = _sample_categorical(p_x0)
-      # randomly and uniformly select an index in the block (among masked tokens)
-      num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
-      ind = torch.randint(0, num_masked, (x_block.shape[0],))
-      ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
-      mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
-      x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
-    else:
-      q_xs = p_x0 * (1 - mask_prob)
-      q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
-      x_block = _sample_categorical(q_xs)
-    copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
-    x_block =  copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
-    x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
+      if self.config.sampling.first_hitting:
+          # C-inf 路径外层已 assert，不会进这里
+          x_block = _sample_categorical(p_x0)
+          num_masked = (x[:, -self.block_size:] == self.mask_index).sum(-1)
+          ind = torch.randint(0, num_masked, (x_block.shape[0],))
+          ind = (x[:, -self.block_size:] == self.mask_index).nonzero()[ind, 1]
+          mask = (torch.arange(self.block_size, device=x.device) == ind[:, None]).to(x_block.dtype)
+          x_block = x_block * mask + x[:, -self.block_size:] * (1 - mask)
+      else:
+          q_xs = p_x0 * (1 - mask_prob)
+          q_xs[:, :, self.mask_index] = mask_prob.squeeze(-1)
 
-    # compute kv cache if all tokens in a block are sampled
-    if self.config.sampling.kv_cache and self.mask_index not in x_block:
-      _ = self.forward(x_block, sigma_t, cond=cond,sample_mode=True, store_kv=True)
+          # ====== C-inf 分支：用 span-correlated sample 替代独立采样 ======
+          if cinf_token_mask is not None:
+              x_block = self._span_correlated_sample(
+                  probs=q_xs,
+                  x=x[:, -self.block_size:],
+                  t=t,
+                  token_mask=cinf_token_mask,
+                  num_steps=cinf_num_steps,
+              )
+          else:
+              x_block = _sample_categorical(q_xs)
+          # =================================================================
 
-    if not torch.allclose(x_new, x):
-      return None, x_new
-    else:
-      return p_x0, x_new
+      copy_flag = (x[:, -self.block_size:] != self.mask_index).to(x.dtype)
+      x_block = copy_flag * x[:, -self.block_size:] + (1 - copy_flag) * x_block
+      x_new = torch.cat((x[:, :-self.block_size], x_block), dim=-1)
+
+      if self.config.sampling.kv_cache and self.mask_index not in x_block:
+          _ = self.forward(x_block, sigma_t, cond=cond, sample_mode=True, store_kv=True)
+
+      if not torch.allclose(x_new, x):
+          return None, x_new
+      else:
+          return p_x0, x_new
 
 
   @torch.no_grad()
@@ -974,6 +1006,35 @@ class Diffusion(L.LightningModule):
     token_mask_key=None,
     return_full_sequence=False,
   ):
+    # === C-inf 入口：对齐训练时的 full_bidir + block_size=seqlen ===
+    if self.structured_inference:
+        assert getattr(self, 'sm_full_bidir', False), \
+            "C-inf 推理要求训练时 full_bidir_attention=True"
+        inf_seqlen = self.config.model.length
+        # 重生成全双向 mask（和训练一致）
+        self.backbone.gen_mask(
+            seqlen=inf_seqlen,
+            block_size=inf_seqlen,   # 传任意值都可，full_bidir=True 时被忽略
+            attn_backend=self.config.model.attn_backend,
+            full_bidir=True,
+        )
+        # mask 搬到 device
+        if hasattr(self.backbone, 'block_diff_mask'):
+            dev = next(self.backbone.parameters()).device
+            if torch.is_tensor(self.backbone.block_diff_mask):
+                self.backbone.block_diff_mask = self.backbone.block_diff_mask.to(dev)
+        # block_size 扩到 seqlen，让 semi_ar 单 stride 并行
+        self._orig_block_size = self.block_size
+        self.block_size = inf_seqlen
+        if hasattr(self.backbone, 'block_size'):
+            self.backbone.block_size = inf_seqlen
+    # kv_cache 的切片逻辑对 block_size=seqlen 会越界，必须关
+    assert not self.config.sampling.kv_cache, \
+        "C-inf 必须设置 sampling.kv_cache=False"
+    # first_hitting 会强制只 unmask 1 个 token，与 span gating 冲突
+    assert not self.config.sampling.first_hitting, \
+        "C-inf 必须设置 sampling.first_hitting=False"
+
     if self.ema:
       self.ema.store(self._get_parameters())
       self.ema.copy_to(self._get_parameters())
@@ -1055,29 +1116,29 @@ class Diffusion(L.LightningModule):
 
     # sample
     if self.structured_inference:
-      # --- C-inf: 使用 analytic sampler 以获得全局 span 可见性 ---
-      print("[C-inf] Using analytic sampler for structured inference")
-      x_out = self._analytic_sampler(
-        n_samples=x_init.shape[0],
-        num_steps=num_steps,
-        seqlen=seqlen,
-        eps=eps,
-        x_init=x_init,
-        cond=cond,
-        token_mask=token_mask,  # 新增参数
-      )
-
+        # C-inf: 用 semi_ar，单 stride 覆盖整个序列，内部嵌入 span gating
+        print("[C-inf] Using semi_ar with block_size=seqlen + span gating")
+        x_out, _ = self._semi_ar_sampler(
+            n_samples=x_init.shape[0],
+            num_steps=num_steps,
+            num_strides=1,                # 关键：只跑 1 个 stride
+            seqlen=seqlen,
+            context_size=seqlen,
+            x_init=x_init,
+            cond=cond,
+            eps=eps,
+            cinf_token_mask=token_mask,   # 新增：透传给内循环
+        )
     elif self.sampler == 'semi_ar':
-
-      x_out, _ = self._semi_ar_sampler(
-        n_samples=x_init.shape[0],
-        num_steps=num_steps,
-        num_strides=(seqlen // self.block_size),
-        seqlen=seqlen,
-        context_size=self.config.sampling.context_size if hasattr(self.config.sampling, 'context_size') else 1024,
-        x_init=x_init,
-        cond=None,
-      )
+        x_out, _ = self._semi_ar_sampler(
+            n_samples=x_init.shape[0],
+            num_steps=num_steps,
+            num_strides=(seqlen // self.block_size),
+            seqlen=seqlen,
+            context_size=self.config.sampling.context_size,
+            x_init=x_init,
+            cond=None,
+        )
     else:
       x_out = self._analytic_sampler(
         n_samples=x_init.shape[0],
@@ -1642,125 +1703,100 @@ class Diffusion(L.LightningModule):
 
   def _span_correlated_sample(self, probs, x, t, token_mask, num_steps):
     """
-    C-inf: Span-level 整体 unmask（策略 A：per-step fixed reveal budget + 单调性钉住）。
+    C-inf: token 级 span-correlated sampling（文档 §3.4 Step 5 对齐）。
 
-    核心逻辑：
-    1. 对每个"还有 masked token"的 span 计算平均置信度
-    2. 按 "每步 reveal 预算 × (1.5 - s)" 决定本步 unmask 几个 span
-       - 高噪声（s≈1）→ 乘 0.5，reveal 少
-       - 低噪声（s≈0）→ 乘 1.5，reveal 多
-    3. 被选中的 span：其所有 masked token 用本步采样结果 unmask
-    4. 未被选中的 span：本步保持 MASK（下一步再考虑）
-    5. 已经 unmask 的 answer token：强制钉住原值（单调性）
+    关键点:
+    - span 切分完全独立于 block_size，按 token 数切
+    - span_size = 1 + s(t) * (B_max - 1)，与训练时 _structured_mask 一致
+    - r_t 用 noise(t) 算真实 move_chance（不是 timestep）
+    - aggregation=mean, commitment=mixed（未选中 span 保持 MASK）, threshold=fixed_ratio
 
     Args:
-        probs:      [B, L, V]  transition probabilities from analytic sampler
-        x:          [B, L]      current token sequence (含已 unmask 的 answer token)
+        probs:      [B, L, V]  q_xs from _ddpm_caching_update（含 mask_index 通道）
+        x:          [B, L]      current token sequence
         t:          [B, 1]      current timestep
-        token_mask: [B, L]      True = answer 区域，False = prefix
-        num_steps:  int         总采样步数（用于算 per-step reveal 预算）
+        token_mask: [B, L]      True = answer region, False = prefix
+        num_steps:  int         总采样步数（用于 reveal 预算）
     """
     B, L, V = probs.shape
     device = probs.device
 
-    # 标准独立采样（作为候选值）
+    # 独立采样（作为候选值）
     samples = _sample_categorical(probs)
 
-    # ===== P0 修复（单调性）=====
-    # 所有已经 unmask 的 answer token 必须保留原值，不能被重新采样
-    # 必须在函数最开头就先做一次，保证即使下面 early-return 也安全
+    # === 单调性保护：已 unmask 的 answer token 不能被重采样 ===
     token_mask_bool = token_mask.bool()
     already_unmasked = (x != self.mask_index) & token_mask_bool
     samples = torch.where(already_unmasked, x, samples)
 
-    # 计算 s(t)
-    r_t = t.squeeze(-1)
+    # === 计算 s(t)：用 noise schedule 算真实 masking ratio ===
+    _, move_chance = self.noise(t)
+    if move_chance.dim() > 1:
+        r_t = move_chance.squeeze(-1)
+    else:
+        r_t = move_chance
+
     s_t = torch.clamp(
         (r_t - self.sm_r_low) / (self.sm_r_high - self.sm_r_low + 1e-8),
         min=0.0, max=1.0
     )
 
-    # s(t) 太小：退化为独立采样（但单调性已钉住）
+    # 极低 s(t)：退化为独立采样（单调性已钉住）
     if s_t.max().item() < 0.05:
         return samples
 
-    block_size = self.block_size
-    n_blocks = L // block_size
-    span_blocks = max(1, int(self.sm_span_blocks))
+    B_max = int(getattr(self, 'sm_b_max_tokens', 32))
 
     for b in range(B):
         s = s_t[b].item()
         if s < 0.05:
             continue
 
-        noised_blk = token_mask_bool[b].view(n_blocks, block_size)
-        answer_blk_mask = (noised_blk.sum(-1) > 0)
-        ans_blk_ids = torch.where(answer_blk_mask)[0]
-        if len(ans_blk_ids) == 0:
+        # === Token 级切 span（与 block_size 完全无关）===
+        ans_token_ids = torch.where(token_mask_bool[b])[0]
+        n_ans = len(ans_token_ids)
+        if n_ans == 0:
             continue
 
-        n_ans_blocks = len(ans_blk_ids)
-        n_spans = max(1, n_ans_blocks // span_blocks)
-        actual_span_size = n_ans_blocks // n_spans
+        # 与训练 _structured_mask 一致的 span_size 公式
+        span_size = max(1, int(round(1 + s * (B_max - 1))))
+        n_spans = max(1, n_ans // span_size)
 
-        # ---------- 收集每个 span 的 (masked 位置, 置信度) ----------
+        # === 收集每个 span 的 masked 位置 + 平均置信度 ===
         span_info = []
         for sp_idx in range(n_spans):
-            sp_start = sp_idx * actual_span_size
-            sp_end = (sp_start + actual_span_size) if sp_idx < n_spans - 1 else n_ans_blocks
-            span_blk_ids = ans_blk_ids[sp_start:sp_end]
+            sp_start = sp_idx * span_size
+            sp_end = min(sp_start + span_size, n_ans) if sp_idx < n_spans - 1 else n_ans
+            span_token_ids = ans_token_ids[sp_start:sp_end]
 
-            masked_positions = []
-            for blk_id in span_blk_ids:
-                st = blk_id.item() * block_size
-                for pos in range(st, st + block_size):
-                    if x[b, pos] == self.mask_index:
-                        masked_positions.append(pos)
-
-            if len(masked_positions) == 0:
-                span_info.append(None)  # span 已完全 unmask，跳过
+            # 只看这个 span 里还 masked 的位置
+            still_masked = (x[b, span_token_ids] == self.mask_index)
+            if not still_masked.any():
+                span_info.append(None)
                 continue
+            pos_tensor = span_token_ids[still_masked]
 
-            pos_tensor = torch.tensor(masked_positions, device=device)
+            # aggregation = mean（文档默认）
+            # 置信度 = 1 - p(mask_index)，越高越 confident
             avg_conf = (1.0 - probs[b, pos_tensor, self.mask_index]).mean().item()
-            span_info.append({
-                'pos_tensor': pos_tensor,
-                'confidence': avg_conf,
-            })
+            span_info.append({'pos_tensor': pos_tensor, 'confidence': avg_conf})
 
         valid_spans = [(i, si) for i, si in enumerate(span_info) if si is not None]
         if len(valid_spans) == 0:
             continue
-
         valid_spans.sort(key=lambda kv: kv[1]['confidence'], reverse=True)
 
-        # ===== 策略 A：per-step fixed reveal budget =====
-        # 本 batch 样本的 answer 区总 token 数
-        total_answer_tokens = int(token_mask_bool[b].sum().item())
-        # 每步均摊的 reveal token 数
-        per_step_budget_tokens = max(1, total_answer_tokens // max(1, num_steps))
-        # 噪声依赖缩放：s=1 → 0.5x（高噪声 reveal 少）；s=0 → 1.5x（低噪声 reveal 多）
-        step_multiplier = 1.5 - s
-        reveal_budget_tokens = max(block_size, int(per_step_budget_tokens * step_multiplier))
-
-        # 换算成 span 数（每个 span 多少 token）
-        tokens_per_span = actual_span_size * block_size
-        n_unmask = max(1, reveal_budget_tokens // max(1, tokens_per_span))
+        # === 每步 reveal 预算（token 级，噪声依赖）===
+        per_step_budget = max(1, n_ans // max(1, num_steps))
+        step_multiplier = 1.5 - s    # s=1(高噪) → 0.5x reveal 少；s=0(低噪) → 1.5x reveal 多
+        reveal_budget = max(span_size, int(per_step_budget * step_multiplier))
+        n_unmask = max(1, reveal_budget // max(1, span_size))
         n_unmask = min(n_unmask, len(valid_spans))
 
-        # ---------- 执行 span 级 gating ----------
+        # === Gating：置信度高的前 n_unmask 个 span 允许 reveal，其余本步保持 MASK ===
         for rank, (sp_idx, si) in enumerate(valid_spans):
-            pos_tensor = si['pos_tensor']
-            if rank < n_unmask:
-                # 被选中 reveal：保留 samples 里的采样结果（已钉住的不受影响）
-                pass
-            else:
-                # 未选中：本步保持 MASK
-                samples[b, pos_tensor] = self.mask_index
-    # DEBUG: 验证单调性没破
-    _violations = (token_mask_bool & (x != self.mask_index) & (samples != x)).sum().item()
-    if _violations > 0:
-        print(f"[C-inf WARNING] 单调性违反 {_violations} 个 token!")
+            if rank >= n_unmask:
+                samples[b, si['pos_tensor']] = self.mask_index
 
     return samples
     
@@ -1847,6 +1883,8 @@ class Diffusion(L.LightningModule):
       x_init=None,
       eps=None,      # semi_ar 不用 eps，但必须接住关键字参数
       cond=None,     # 兼容旧调用：传 cond=... 时映射到 cond_stream
+      cinf_token_mask=None,   # 新增
+      cinf_num_steps=None,
   ):
       """
       Semi-autoregressive / stride-wise sampler.
@@ -1931,12 +1969,15 @@ class Diffusion(L.LightningModule):
               else:
                   t = float(timesteps[i].item())
 
-              # cond window
               cond_win = None
               if cond_stream is not None:
                   cond_win = cond_stream[:, fwd_idx]
-                  # forward 里会自动对齐长度，但这里保持一致更清楚
                   cond_win = cond_win.to(self.device)
+
+              # --- C-inf: 按 fwd_idx 切 token_mask ---
+              cinf_mask_win = None
+              if cinf_token_mask is not None:
+                  cinf_mask_win = cinf_token_mask[:, fwd_idx].to(self.device)
 
               p_x0_cache, x_next = self._ddpm_caching_update(
                   x=x_win,
@@ -1944,6 +1985,8 @@ class Diffusion(L.LightningModule):
                   dt=dt,
                   p_x0=p_x0_cache,
                   cond=cond_win,
+                  cinf_token_mask=cinf_mask_win,      # 新增
+                  cinf_num_steps=cinf_num_steps,       # 新增
               )
 
               if p_x0_cache is None:

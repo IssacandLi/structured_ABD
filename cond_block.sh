@@ -64,8 +64,10 @@ srun bash -lc '
   	algo.structured_masking.enabled=True \
   	algo.structured_masking.r_low=0.3 \
     algo.structured_masking.r_high=0.7 \
-    algo.structured_masking.span_blocks=2 \
+    algo.structured_masking.b_max_tokens=32 \
     algo.structured_masking.global_t=True \
+    algo.structured_masking.full_bidir_attention=True \
+    algo.clip_search_widths=[] \
     algo.span_loss.enabled=False \
     algo.span_loss.lambda_span=1.0 \
     algo.span_loss.type=bow \

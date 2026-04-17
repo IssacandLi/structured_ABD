@@ -73,6 +73,17 @@ def block_diff_mask(b, h, q_idx, kv_idx, block_size=None, n=None):
   # **4. Combine Masks **
   return block_diagonal | offset_block_causal | block_causal
 
+def full_bidir_two_stream_mask(b, h, q_idx, kv_idx, n=None):
+    """
+    xt (q_idx < n) 对整段 [xt|cond] 全双向；x0 (q_idx >= n) 只看 x0 内部全双向。
+    cond 流里 answer 位置已在 _build_cond_stream 被 wipe 成 MASK，无 GT 泄露。
+    """
+    x0_flag_q = (q_idx >= n)
+    x0_flag_kv = (kv_idx >= n)
+    xt_sees_all = (x0_flag_q == 0)
+    x0_sees_x0 = (x0_flag_q == 1) & (x0_flag_kv == 1)
+    return xt_sees_all | x0_sees_x0
+
 @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
 def fused_flex_attention(q, k, v, mask=None):
     return flex_attention(q, k, v, block_mask=mask)
@@ -703,18 +714,23 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     else:
       return bias_dropout_add_scale_fused_inference
     
-  def gen_mask(self, seqlen, block_size, attn_backend='sdpa'):
-    """Genererates attention mask"""
-    if attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
-      self.block_diff_mask = create_block_mask(
-        partial(block_diff_mask, block_size=block_size, n=seqlen),
-        B=None, H=None, Q_LEN=seqlen*2, KV_LEN=seqlen*2)
-    elif attn_backend == 'sdpa':
-      self.block_diff_mask = block_diff_mask(
-        b=None, h=None, q_idx=torch.arange(seqlen*2)[:, None], 
-        kv_idx=torch.arange(seqlen*2)[None, :], block_size=block_size, n=seqlen)
-    else:
-      raise ValueError('Unknown attention backend')
+  def gen_mask(self, seqlen, block_size, attn_backend='sdpa', full_bidir=False):
+      """Generates attention mask. If full_bidir=True, use span-agnostic full-bidir."""
+      if full_bidir:
+          mask_fn = partial(full_bidir_two_stream_mask, n=seqlen)
+      else:
+          mask_fn = partial(block_diff_mask, block_size=block_size, n=seqlen)
+      
+      if attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
+          self.block_diff_mask = create_block_mask(
+              mask_fn, B=None, H=None, Q_LEN=seqlen*2, KV_LEN=seqlen*2)
+      elif attn_backend == 'sdpa':
+          self.block_diff_mask = mask_fn(
+              b=None, h=None,
+              q_idx=torch.arange(seqlen*2)[:, None],
+              kv_idx=torch.arange(seqlen*2)[None, :])
+      else:
+          raise ValueError('Unknown attention backend')
     
   def reset_kv_cache(self):
     for block in self.blocks:
