@@ -391,7 +391,6 @@ class Diffusion(L.LightningModule):
     # else:
     #   x_cat = x
     use_two_stream = (self.cross_attn and (cond is not None) and (not sample_mode))
-    # use_two_stream = (self.cross_attn and (cond is not None))
 
     if use_two_stream:
         cond = cond.long()
@@ -717,10 +716,10 @@ class Diffusion(L.LightningModule):
 
   def _structured_mask(self, x, p, block_size, noised_mask):
     """
-    Mechanism C (文档 §3.4 Step 1 严格实现)：
+    Mechanism C:
     - span 按 token 切分，与 block_size 完全无关
     - span_size = 1 + s(t) * (B_max - 1)，随噪声线性增长
-    - 高噪声纯 span mask，低噪声近似 token mask
+    - 用 span-level + token-level residual mixture 对齐目标 masking ratio
     """
     B, L = x.shape
     device = x.device
@@ -753,17 +752,13 @@ class Diffusion(L.LightningModule):
         span_size = max(1, int(round(1 + s * (B_max - 1))))
         n_spans = max(1, n_ans // span_size)
 
-        # ---- 校准 span mask 概率，使 E[masked tokens] ≈ r * n_ans ----
-        # 单 span 的期望 mask token 数 = p_span * span_size * 1 + p_span * span_size * 0
-        # 但 s<1 时 span 内还会个别保留 (1-s) 比例，故每被选中 span 实际平均 mask = span_size * s
-        # 加上未选中 span 整 span 不 mask
-        # → E[total masked] ≈ p_span * n_spans * span_size * s   （s=1 时退化为 p_span * n_ans）
-        # 想要等于 r * n_ans，则 p_span = r / s 当 s>0
-        # s=0 时已经退化为 token-level，整段公式不适用
-        if s > 0:
-            p_span = min(1.0, r / max(s, 1e-3))
+        # 让一部分 token 以整 span 方式被 mask，剩余质量由 token 级 residual 补齐，
+        # 从而保证 E[masked ratio] = r。
+        p_span = max(0.0, min(1.0, r * s))
+        if p_span >= 1.0:
+            p_token = 0.0
         else:
-            p_span = r
+            p_token = max(0.0, min(1.0, (r - p_span) / max(1.0 - p_span, 1e-8)))
         span_mask_decisions = (torch.rand(n_spans, device=device) < p_span)
 
         for sp_idx in range(n_spans):
@@ -772,15 +767,13 @@ class Diffusion(L.LightningModule):
             span_token_ids = ans_token_ids[sp_start:sp_end]
 
             if span_mask_decisions[sp_idx]:
-                if s < 1.0:
-                    # span 内以概率 (1-s) 个别保留
-                    keep = torch.rand(len(span_token_ids), device=device) < (1.0 - s)
-                    to_mask = span_token_ids[~keep]
-                else:
-                    to_mask = span_token_ids
-                if len(to_mask) > 0:
-                    xt[b, to_mask] = self.mask_index
-            # else: 整个 span 保留，xt 已经 = x.clone() 不动
+                xt[b, span_token_ids] = self.mask_index
+                continue
+
+            token_mask = torch.rand(len(span_token_ids), device=device) < p_token
+            to_mask = span_token_ids[token_mask]
+            if len(to_mask) > 0:
+                xt[b, to_mask] = self.mask_index
 
     return xt
 
@@ -861,8 +854,22 @@ class Diffusion(L.LightningModule):
       move_chance_s = move_chance_s[:, None]
       mask_prob = move_chance_s / move_chance_t
 
+      use_two_stream_sampling = (
+          cinf_token_mask is not None
+          and cond is not None
+          and not self.config.sampling.kv_cache
+          and x.shape[1] == self.config.model.length
+      )
+
       if p_x0 is None:
-          if self.config.sampling.kv_cache:
+          if use_two_stream_sampling:
+              p_x0 = self.forward(
+                  x,
+                  sigma_t,
+                  cond=cond,
+                  sample_mode=False).to(torch.float64)
+              p_x0 = p_x0[:, -self.block_size:]
+          elif self.config.sampling.kv_cache:
               p_x0 = self.forward(x[:, -self.block_size:],
                                   sigma_t, cond=cond, sample_mode=True).to(torch.float64)
           else:
@@ -1105,15 +1112,11 @@ class Diffusion(L.LightningModule):
             end = min(seqlen, ans_start + gen_len)
             gen_mask[b, ans_start:end] = True
 
-    # x_init: pin prefix, mask answer
-    # x_init = x0.clone()
-    # if token_mask is not None:
-    #   x_init[token_mask] = self.mask_index
-    # else:
-    #   x_init[:, 1:] = self.mask_index
+    sample_token_mask = gen_mask if gen_mask is not None else token_mask
+
     x_init = x0.clone()
-    if gen_mask is not None:
-        x_init[gen_mask] = self.mask_index
+    if sample_token_mask is not None:
+        x_init[sample_token_mask] = self.mask_index
     else:
         x_init[:, 1:] = self.mask_index
 
@@ -1121,84 +1124,87 @@ class Diffusion(L.LightningModule):
     cond = None
     if self.cross_attn:
       cond = x0.clone()
-      if token_mask is not None:
-        cond[gen_mask] = self.mask_index
+      if sample_token_mask is not None:
+        cond[sample_token_mask] = self.mask_index
       else:
         cond[:, 1:] = self.mask_index
 
-    # sample
-    if self.structured_inference:
-        # C-inf: 用 semi_ar，单 stride 覆盖整个序列，内部嵌入 span gating
-        print("[C-inf] Using semi_ar with block_size=seqlen + span gating")
-        x_out, _ = self._semi_ar_sampler(
-            n_samples=x_init.shape[0],
-            num_steps=num_steps,
-            num_strides=1,                # 关键：只跑 1 个 stride
-            seqlen=seqlen,
-            context_size=seqlen,
-            x_init=x_init,
-            cond=cond,
-            eps=eps,
-            cinf_token_mask=gen_mask,   # 新增：透传给内循环
-            cinf_num_steps=num_steps,
+    try:
+      # sample
+      if self.structured_inference:
+          # C-inf: 用 semi_ar，单 stride 覆盖整个序列，内部嵌入 span gating
+          print("[C-inf] Using semi_ar with block_size=seqlen + span gating")
+          x_out, _ = self._semi_ar_sampler(
+              n_samples=x_init.shape[0],
+              num_steps=num_steps,
+              num_strides=1,                # 关键：只跑 1 个 stride
+              seqlen=seqlen,
+              context_size=seqlen,
+              x_init=x_init,
+              cond=cond,
+              eps=eps,
+              cinf_token_mask=sample_token_mask,
+              cinf_num_steps=num_steps,
+          )
+      elif self.sampler == 'semi_ar':
+          x_out, _ = self._semi_ar_sampler(
+              n_samples=x_init.shape[0],
+              num_steps=num_steps,
+              num_strides=(seqlen // self.block_size),
+              seqlen=seqlen,
+              context_size=self.config.sampling.context_size,
+              x_init=x_init,
+              cond=None,
+          )
+      else:
+        x_out = self._analytic_sampler(
+          n_samples=x_init.shape[0],
+          num_steps=num_steps,
+          seqlen=seqlen,
+          eps=eps,
+          x_init=x_init,
+          cond=cond,
         )
-    elif self.sampler == 'semi_ar':
-        x_out, _ = self._semi_ar_sampler(
-            n_samples=x_init.shape[0],
-            num_steps=num_steps,
-            num_strides=(seqlen // self.block_size),
-            seqlen=seqlen,
-            context_size=self.config.sampling.context_size,
-            x_init=x_init,
-            cond=None,
-        )
-    else:
-      x_out = self._analytic_sampler(
-        n_samples=x_init.shape[0],
-        num_steps=num_steps,
-        seqlen=seqlen,
-        eps=eps,
-        x_init=x_init,
-        cond=cond,
-      )
 
-    if self.ema:
-      self.ema.restore(self._get_parameters())
+      if self.ema:
+        self.ema.restore(self._get_parameters())
 
-    # if x_out is None:
-    #   print("[DEBUG] x_out is None - sampling failed due to stop conditions")
-    #   return None
-    if x_out is None:
-      print("[DEBUG] x_out is None - sampling failed due to stop conditions")
-      print("[DEBUG] Retrying without stop conditions is not implemented; returning empty strings")
-      return [""] * batch['input_ids'].shape[0]
-    print(f"[DEBUG] x_out shape: {x_out.shape}")
-    print(f"[DEBUG] x_out sample (first 50): {x_out[0, :50].tolist()}")
-    print(f"[DEBUG] x_out sample (last 50): {x_out[0, -50:].tolist()}")
-    print(f"[DEBUG] token_mask shape: {token_mask.shape if token_mask is not None else None}")
-    if token_mask is not None:
-        print(f"[DEBUG] token_mask has any True: {token_mask[0].any().item()}")
-        if token_mask[0].any():
-            ans_pos = int(torch.where(token_mask[0])[0][0].item())
-            print(f"[DEBUG] ans_pos: {ans_pos}")
-            print(f"[DEBUG] answer region tokens: {x_out[0, ans_pos:ans_pos+20].tolist()}")
+      if x_out is None:
+        print("[DEBUG] x_out is None - sampling failed due to stop conditions")
+        print("[DEBUG] Retrying without stop conditions is not implemented; returning empty strings")
+        return [""] * batch['input_ids'].shape[0]
+      print(f"[DEBUG] x_out shape: {x_out.shape}")
+      print(f"[DEBUG] x_out sample (first 50): {x_out[0, :50].tolist()}")
+      print(f"[DEBUG] x_out sample (last 50): {x_out[0, -50:].tolist()}")
+      print(f"[DEBUG] token_mask shape: {sample_token_mask.shape if sample_token_mask is not None else None}")
+      if sample_token_mask is not None:
+          print(f"[DEBUG] token_mask has any True: {sample_token_mask[0].any().item()}")
+          if sample_token_mask[0].any():
+              ans_pos = int(torch.where(sample_token_mask[0])[0][0].item())
+              print(f"[DEBUG] ans_pos: {ans_pos}")
+              print(f"[DEBUG] answer region tokens: {x_out[0, ans_pos:ans_pos+20].tolist()}")
 
-    if return_full_sequence:
-      return self.tokenizer.batch_decode(x_out)
+      if return_full_sequence:
+        return self.tokenizer.batch_decode(x_out)
 
-    # return only answer part (cut from first answer position, stop at EOS)
-    if token_mask is None:
-      return self.tokenizer.batch_decode(x_out)
+      # return only answer part (cut from first answer position, stop at EOS)
+      if token_mask is None:
+        return self.tokenizer.batch_decode(x_out)
 
-    out_texts = []
-    for b in range(x_out.shape[0]):
-      ans_pos = int(torch.where(token_mask[b])[0][0].item()) if token_mask[b].any() else 0
-      seq = x_out[b, ans_pos:]
-      eos = torch.where(seq == self.tokenizer.eos_token_id)[0]
-      if len(eos) > 0:
-        seq = seq[: int(eos[0].item()) + 1]
-      out_texts.append(self.tokenizer.decode(seq, skip_special_tokens=True))
-    return out_texts
+      out_texts = []
+      for b in range(x_out.shape[0]):
+        ans_pos = int(torch.where(token_mask[b])[0][0].item()) if token_mask[b].any() else 0
+        seq = x_out[b, ans_pos:]
+        eos = torch.where(seq == self.tokenizer.eos_token_id)[0]
+        if len(eos) > 0:
+          seq = seq[: int(eos[0].item()) + 1]
+        out_texts.append(self.tokenizer.decode(seq, skip_special_tokens=True))
+      return out_texts
+    finally:
+      if self.structured_inference and hasattr(self, '_orig_block_size'):
+        self.block_size = self._orig_block_size
+        if hasattr(self.backbone, 'block_size'):
+          self.backbone.block_size = self._orig_block_size
 
 
   def restore_model_and_sample(self, num_steps, eps=1e-5, seqlen=None):
@@ -1640,9 +1646,10 @@ class Diffusion(L.LightningModule):
     if s_t.max().item() < 0.05:
         return x
 
-    # span_blocks = max(1, int(self.sm_span_blocks))
-    # token_mask_bool = token_mask.bool()
-    # x_out = x.clone()
+    B_max = int(getattr(self, 'sm_b_max_tokens', 32))
+    span_blocks = max(1, B_max // max(1, block_size))
+    token_mask_bool = token_mask.bool()
+    x_out = x.clone()
 
     for b in range(B):
         s = s_t[b].item()
@@ -1718,6 +1725,54 @@ class Diffusion(L.LightningModule):
 
     return x_out
 
+  def _aggregate_span_confidence(self, confidences):
+    if confidences.numel() == 0:
+      return 0.0
+
+    mode = getattr(self, 'cinf_aggregation', 'mean')
+    if mode == 'mean':
+      return confidences.mean().item()
+    if mode == 'max':
+      return confidences.max().item()
+    if mode == 'top_k_mean':
+      k = max(1, math.ceil(confidences.numel() / 2))
+      return confidences.topk(k).values.mean().item()
+    raise ValueError(f'Unknown C-inf aggregation mode: {mode}')
+
+  def _adaptive_confidence_threshold(self, confidences, s):
+    mean = confidences.mean()
+    std = confidences.std(unbiased=False)
+    return mean + (0.25 * s) * std
+
+  def _select_spans_for_reveal(self, valid_spans, reveal_budget, s):
+    if len(valid_spans) == 0:
+      return set()
+
+    threshold_mode = getattr(self, 'cinf_threshold', 'fixed_ratio')
+    selected = set()
+
+    if threshold_mode == 'fixed_ratio':
+      revealed = 0
+      for rank, (_, span_data) in enumerate(valid_spans):
+        if rank == 0 or revealed < reveal_budget:
+          selected.add(rank)
+          revealed += span_data['pos_tensor'].numel()
+      return selected
+
+    if threshold_mode == 'adaptive':
+      conf_tensor = torch.tensor(
+          [span_data['confidence'] for _, span_data in valid_spans],
+          device=self.device)
+      threshold = self._adaptive_confidence_threshold(conf_tensor, s)
+      for rank, (_, span_data) in enumerate(valid_spans):
+        if span_data['confidence'] >= threshold.item():
+          selected.add(rank)
+      if not selected:
+        selected.add(0)
+      return selected
+
+    raise ValueError(f'Unknown C-inf threshold mode: {threshold_mode}')
+
   def _span_correlated_sample(self, probs, x, t, token_mask, num_steps):
     """
     C-inf: token 级 span-correlated sampling（文档 §3.4 Step 5 对齐）。
@@ -1779,7 +1834,7 @@ class Diffusion(L.LightningModule):
         span_size = max(1, int(round(1 + s * (B_max - 1))))
         n_spans = max(1, n_ans // span_size)
 
-        # === 收集每个 span 的 masked 位置 + 平均置信度 ===
+        # === 收集每个 span 的 masked 位置 + 聚合置信度 ===
         span_info = []
         for sp_idx in range(n_spans):
             sp_start = sp_idx * span_size
@@ -1793,10 +1848,9 @@ class Diffusion(L.LightningModule):
                 continue
             pos_tensor = span_token_ids[still_masked]
 
-            # aggregation = mean（文档默认）
-            # 置信度 = 1 - p(mask_index)，越高越 confident
-            avg_conf = (1.0 - probs[b, pos_tensor, self.mask_index]).mean().item()
-            span_info.append({'pos_tensor': pos_tensor, 'confidence': avg_conf})
+            token_conf = 1.0 - probs[b, pos_tensor, self.mask_index]
+            span_conf = self._aggregate_span_confidence(token_conf)
+            span_info.append({'pos_tensor': pos_tensor, 'confidence': span_conf})
 
         valid_spans = [(i, si) for i, si in enumerate(span_info) if si is not None]
         if len(valid_spans) == 0:
@@ -1807,13 +1861,27 @@ class Diffusion(L.LightningModule):
         per_step_budget = max(1, n_ans // max(1, num_steps))
         step_multiplier = 1.5 - s    # s=1(高噪) → 0.5x reveal 少；s=0(低噪) → 1.5x reveal 多
         reveal_budget = max(span_size, int(per_step_budget * step_multiplier))
-        n_unmask = max(1, reveal_budget // max(1, span_size))
-        n_unmask = min(n_unmask, len(valid_spans))
+        selected_ranks = self._select_spans_for_reveal(valid_spans, reveal_budget, s)
 
-        # === Gating：置信度高的前 n_unmask 个 span 允许 reveal，其余本步保持 MASK ===
+        commitment_mode = getattr(self, 'cinf_commitment', 'mixed')
+        token_only_samples = None
+        if commitment_mode == 'hard':
+            token_only_probs = probs[b].clone()
+            token_only_probs[:, self.mask_index] = 0
+            token_norm = token_only_probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            token_only_probs = token_only_probs / token_norm
+            token_only_samples = _sample_categorical(token_only_probs)
+
+        # === Gating：只让选中的 span 有机会 reveal，其余本步保持 MASK ===
         for rank, (sp_idx, si) in enumerate(valid_spans):
-            if rank >= n_unmask:
+            if rank not in selected_ranks:
                 samples[b, si['pos_tensor']] = self.mask_index
+                continue
+
+            if commitment_mode == 'hard':
+                samples[b, si['pos_tensor']] = token_only_samples[si['pos_tensor']]
+            elif commitment_mode != 'mixed':
+                raise ValueError(f'Unknown C-inf commitment mode: {commitment_mode}')
 
     return samples
     

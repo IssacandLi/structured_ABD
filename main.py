@@ -91,6 +91,8 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
 
 def generate_samples(config, logger, tokenizer):
   conditional = bool(getattr(config.data, "conditional_generation", False))
+  conditional_metric = str(
+    getattr(config.eval, 'conditional_metric', 'rouge')).lower()
   logger.info('Generating samples.')
   model = _load_from_checkpoint(config=config,
                                 tokenizer=tokenizer)
@@ -122,6 +124,10 @@ def generate_samples(config, logger, tokenizer):
         token_mask_key='attention_mask',
         return_full_sequence=False)
 
+      if pred_i is None:
+        logger.warning(f"[Batch {b_idx}] Sampling returned None, skipping")
+        continue
+
       # Extract prefix text + ground-truth answer from batch for logging
       input_ids = batch['input_ids']
       mask = batch['attention_mask']
@@ -143,23 +149,40 @@ def generate_samples(config, logger, tokenizer):
         if tokenizer.eos_token_id in gt_ids:
           gt_ids = gt_ids[:gt_ids.index(tokenizer.eos_token_id)]
 
-        prefixes.append(tokenizer.decode(prefix_ids))
-        gts.append(tokenizer.decode(gt_ids))
+        prefixes.append(tokenizer.decode(prefix_ids, skip_special_tokens=True))
+        gts.append(tokenizer.decode(gt_ids, skip_special_tokens=True))
 
       # pred_i is a list length = batch size
-      # preds.extend(pred_i)
-      if pred_i is None:
-          logger.warning(f"[Batch {b_idx}] Sampling returned None, skipping")
-          continue
       preds.extend(pred_i)
-    model.metrics.reset()  # 可选：避免遗留值；更保险
-    model.metrics.record_conditional_perplexity(
-        prefixes=prefixes,
-        answers=preds,          # 这里用你的生成 answer 文本
-        max_length=2048,
-        device='cuda',
-    )
-    print("Generative perplexity:", model.metrics.gen_ppl.compute())
+    model.metrics.reset()
+    if conditional_metric == 'rouge':
+      model.metrics.record_rouge_scores(
+        predictions=preds,
+        references=gts,
+      )
+      print('ROUGE-1:', float(model.metrics.gen_rouge1.compute()))
+      print('ROUGE-2:', float(model.metrics.gen_rouge2.compute()))
+      print('ROUGE-L:', float(model.metrics.gen_rougeL.compute()))
+      metric_save_dict = {
+        'rouge1': model.metrics.gen_rouge1s,
+        'rouge2': model.metrics.gen_rouge2s,
+        'rougeL': model.metrics.gen_rougeLs,
+      }
+    elif conditional_metric == 'ppl':
+      model.metrics.record_conditional_perplexity(
+          prefixes=prefixes,
+          answers=preds,
+          max_length=2048,
+          device='cuda',
+      )
+      print('Generative perplexity:', float(model.metrics.gen_ppl.compute()))
+      metric_save_dict = {
+        'gen_ppl': model.metrics.gen_ppls,
+      }
+    else:
+      raise ValueError(
+        f'Unsupported eval.conditional_metric={conditional_metric!r}. '
+        f'Expected one of: rouge, ppl.')
     # Print a few examples
     k = min(3, len(preds))
     for i in range(k):
@@ -174,8 +197,8 @@ def generate_samples(config, logger, tokenizer):
       'gt': [[g] for g in gts],
       'pred': [[p] for p in preds],
       'seed': [config.seed for _ in range(len(preds))],
-      'gen_ppl': model.metrics.gen_ppls,
     }
+    save_dict.update(metric_save_dict)
 
     utils.update_and_save_csv(save_dict, csv_path)
     return preds

@@ -9,6 +9,11 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import math
 
+try:
+  from rouge_score import rouge_scorer
+except ImportError:
+  rouge_scorer = None
+
 LOG2 = torch.log(torch.tensor(2.0))
 
 class NLL(torchmetrics.aggregation.MeanMetric):
@@ -49,9 +54,13 @@ class Metrics:
     self.train_nlls = metrics.clone(prefix='train/')
     self.valid_nlls = metrics.clone(prefix='val/')
     self.gen_ppl = Perplexity()
+    self.gen_rouge1 = torchmetrics.aggregation.MeanMetric()
+    self.gen_rouge2 = torchmetrics.aggregation.MeanMetric()
+    self.gen_rougeL = torchmetrics.aggregation.MeanMetric()
     self.gen_entropy = NLL()
     self.gen_ppls, self.gen_nfes, self.gen_entropies, self.gen_lengths \
       = [], [], [], []
+    self.gen_rouge1s, self.gen_rouge2s, self.gen_rougeLs = [], [], []
 
     self.sampling_eps = config.training.sampling_eps
     if getattr(config.algo, 'clip_search_delta', None):
@@ -68,6 +77,11 @@ class Metrics:
     if self.tokenizer.pad_token is None:
       self.tokenizer.pad_token = self.tokenizer.eos_token
       self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+    self.rouge_scorer = None
+    if rouge_scorer is not None:
+      self.rouge_scorer = rouge_scorer.RougeScorer(
+        ['rouge1', 'rouge2', 'rougeL'],
+        use_stemmer=True)
 
   def init_valid_vars(self):
     eps = self.sampling_eps
@@ -90,15 +104,22 @@ class Metrics:
     self.train_nlls = self.train_nlls.to(*args, **kwargs)
     self.valid_nlls = self.valid_nlls.to(*args, **kwargs)
     self.gen_ppl = self.gen_ppl.to(*args, **kwargs)
+    self.gen_rouge1 = self.gen_rouge1.to(*args, **kwargs)
+    self.gen_rouge2 = self.gen_rouge2.to(*args, **kwargs)
+    self.gen_rougeL = self.gen_rougeL.to(*args, **kwargs)
     self.nfes = self.nfes.to(*args, **kwargs)
     self.gen_entropy = self.gen_entropy.to(*args, **kwargs)
 
   def reset(self):
     self.gen_ppls, self.gen_nfes, self.gen_entropies, self.gen_lengths \
       = [], [], [], []
+    self.gen_rouge1s, self.gen_rouge2s, self.gen_rougeLs = [], [], []
     self.train_nlls.reset()
     self.valid_nlls.reset()
     self.gen_ppl.reset()
+    self.gen_rouge1.reset()
+    self.gen_rouge2.reset()
+    self.gen_rougeL.reset()
     self.gen_entropy.reset()
     self.nfes.reset()
     if getattr(self.config.algo, 'var_min', None):
@@ -145,6 +166,120 @@ class Metrics:
       attn_mask = attn_mask.to(device)
       samples = samples.to(device)      
     return samples, attn_mask, eval_context_size
+
+  @staticmethod
+  def _rouge_tokens(text: str) -> typing.List[str]:
+    text = '' if text is None else str(text)
+    text = text.lower().replace('\n', ' ')
+    text = ' '.join(text.split())
+    if not text:
+      return []
+    return text.split(' ')
+
+  @staticmethod
+  def _ngram_counts(tokens: typing.List[str], n: int):
+    counts = {}
+    for i in range(len(tokens) - n + 1):
+      ngram = tuple(tokens[i:i + n])
+      counts[ngram] = counts.get(ngram, 0) + 1
+    return counts
+
+  @staticmethod
+  def _f1_from_overlap(overlap: int, pred_total: int, ref_total: int) -> float:
+    if overlap <= 0 or pred_total <= 0 or ref_total <= 0:
+      return 0.0
+    precision = overlap / pred_total
+    recall = overlap / ref_total
+    if precision + recall == 0:
+      return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+  def _rouge_n_f1(
+    self,
+    pred_tokens: typing.List[str],
+    ref_tokens: typing.List[str],
+    n: int,
+  ) -> float:
+    if len(pred_tokens) < n or len(ref_tokens) < n:
+      return 0.0
+
+    pred_counts = self._ngram_counts(pred_tokens, n)
+    ref_counts = self._ngram_counts(ref_tokens, n)
+    overlap = 0
+    for ngram, pred_count in pred_counts.items():
+      overlap += min(pred_count, ref_counts.get(ngram, 0))
+    return self._f1_from_overlap(
+      overlap=overlap,
+      pred_total=sum(pred_counts.values()),
+      ref_total=sum(ref_counts.values()))
+
+  @staticmethod
+  def _lcs_length(
+    pred_tokens: typing.List[str],
+    ref_tokens: typing.List[str],
+  ) -> int:
+    if not pred_tokens or not ref_tokens:
+      return 0
+
+    dp = [0] * (len(ref_tokens) + 1)
+    for pred_token in pred_tokens:
+      prev_diag = 0
+      for j, ref_token in enumerate(ref_tokens, start=1):
+        prev_up = dp[j]
+        if pred_token == ref_token:
+          dp[j] = prev_diag + 1
+        else:
+          dp[j] = max(dp[j], dp[j - 1])
+        prev_diag = prev_up
+    return dp[-1]
+
+  def _rouge_l_f1(
+    self,
+    pred_tokens: typing.List[str],
+    ref_tokens: typing.List[str],
+  ) -> float:
+    lcs = self._lcs_length(pred_tokens, ref_tokens)
+    return self._f1_from_overlap(
+      overlap=lcs,
+      pred_total=len(pred_tokens),
+      ref_total=len(ref_tokens))
+
+  def record_rouge_scores(
+    self,
+    predictions: typing.List[str],
+    references: typing.List[str],
+  ) -> None:
+    if len(predictions) != len(references):
+      raise ValueError(
+        f'ROUGE expects equal number of predictions and references, '
+        f'got {len(predictions)} predictions vs {len(references)} references.')
+
+    self.gen_rouge1.reset()
+    self.gen_rouge2.reset()
+    self.gen_rougeL.reset()
+    self.gen_rouge1s, self.gen_rouge2s, self.gen_rougeLs = [], [], []
+
+    for pred, ref in zip(predictions, references):
+      if self.rouge_scorer is not None:
+        rouge_scores = self.rouge_scorer.score(ref or '', pred or '')
+        rouge1 = rouge_scores['rouge1'].fmeasure
+        rouge2 = rouge_scores['rouge2'].fmeasure
+        rougeL = rouge_scores['rougeL'].fmeasure
+      else:
+        pred_tokens = self._rouge_tokens(pred)
+        ref_tokens = self._rouge_tokens(ref)
+
+        rouge1 = self._rouge_n_f1(pred_tokens, ref_tokens, n=1)
+        rouge2 = self._rouge_n_f1(pred_tokens, ref_tokens, n=2)
+        rougeL = self._rouge_l_f1(pred_tokens, ref_tokens)
+
+      self.gen_rouge1s.append(rouge1)
+      self.gen_rouge2s.append(rouge2)
+      self.gen_rougeLs.append(rougeL)
+
+      self.gen_rouge1.update(rouge1)
+      self.gen_rouge2.update(rouge2)
+      self.gen_rougeL.update(rougeL)
     
   @torch.no_grad()
   def record_conditional_perplexity(

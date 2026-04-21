@@ -36,11 +36,10 @@ python -u main.py \
   sampling.kv_cache=false \
   +sampling.context_size=512 \
   sampling.logdir=$PWD/sample_logs/cnn_dm_cond_bs4 \
-  eval.checkpoint_path=$PWD/outputs/cnn_dailymail/2026.04.08/113455/checkpoints/best.ckpt \
+  eval.checkpoint_path=$PWD/outputs/cnn_dailymail/2026.04.16/155216/checkpoints/best.ckpt \
   algo.structured_masking.enabled=True \
   algo.structured_masking.r_low=0.3 \
   algo.structured_masking.r_high=0.7 \
-  algo.structured_masking.span_blocks=2 \
   algo.structured_masking.global_t=True \
   algo.span_loss.enabled=False \
   algo.span_loss.lambda_span=1.0 \
@@ -48,4 +47,9 @@ python -u main.py \
   algo.structured_inference.enabled=True \
   algo.structured_inference.aggregation=mean \
   algo.structured_inference.commitment=mixed \
-  algo.structured_inference.threshold=fixed_ratio
+  algo.structured_inference.threshold=fixed_ratio \
+  algo.structured_masking.b_max_tokens=32 \
+  algo.structured_masking.full_bidir_attention=True \
+  sampling.kv_cache=False \
+  sampling.first_hitting=False \
+  model.attn_backend=sdpa

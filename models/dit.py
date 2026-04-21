@@ -762,6 +762,11 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
           x_full = torch.zeros((
             x.shape[0], accum_length, x.shape[2]), device=x.device)
           rotary_cos_sin = self.rotary_emb(x_full)
+        # elif x.shape[1] == 2 * self.n:
+        #   # 两流推理（C-inf）：用完整的 [2L, 2L] mask，rotary 只用前 L 个位置
+        #   mask = self.block_diff_mask
+        #   rotary_cos_sin = self.rotary_emb(x[:, :self.n])
+
         else:
           # index block-causal mask only during sampling
           mask = mask[
@@ -787,5 +792,6 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
           store_kv=store_kv)
       x = self.output_layer(x, t_cond)
     if cross_attn and not sample_mode:
+    # if cross_attn and x.shape[1] == 2 * self.n:
       x = x[:, :self.n]
     return x

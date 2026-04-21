@@ -43,11 +43,19 @@ def print_nans(tensor, name):
     print(name, tensor)
 
 def update_and_save_csv(save_dict, csv_path):
-  num_samples = len(save_dict['gen_ppl'])
+  if not save_dict:
+    return
+
+  lengths = {k: len(v) for k, v in save_dict.items()}
+  num_samples = next(iter(lengths.values()))
+  if any(length != num_samples for length in lengths.values()):
+    raise ValueError(f'CSV columns have inconsistent lengths: {lengths}')
+
+  file_exists = fsspec_exists(csv_path)
   with fsspec.open(csv_path, 'a') as f:
     writer = csv.DictWriter(f, fieldnames=save_dict.keys())
-    if fsspec_exists(csv_path) is False:
-        writer.writeheader()
+    if not file_exists:
+      writer.writeheader()
     for i in range(num_samples):
       row = {k: v[i] for k, v in save_dict.items()}
       writer.writerow(row)
