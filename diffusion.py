@@ -14,6 +14,7 @@ import dataloader
 import metrics
 import models
 import noise_schedule
+import sampling_diagnostics
 import utils
 import numpy as np
 import itertools
@@ -141,6 +142,15 @@ class Diffusion(L.LightningModule):
       
     self.time_conditioning = self.config.algo.time_conditioning
     self.neg_infinity = -1000000.0
+
+    diagnostics_cfg = getattr(self.config, 'diagnostics', None)
+    self.diagnostics_enabled = bool(
+      getattr(diagnostics_cfg, 'enabled', False))
+    self.diagnostics_snapshot_reveal_fractions = list(
+      getattr(diagnostics_cfg, 'snapshot_reveal_fractions', [0.1, 0.3, 0.5, 0.7]))
+    self.diagnostics_early_fraction = float(
+      getattr(diagnostics_cfg, 'early_fraction', 0.3))
+    self._last_sampling_diagnostics = []
   
     # --- C-inf: Structured Unmasking at Inference ---
 
@@ -169,6 +179,11 @@ class Diffusion(L.LightningModule):
     self.fast_forward_epochs = None
     self.fast_forward_batches = None
     self._validate_configuration()
+
+  def pop_last_sampling_diagnostics(self):
+    records = self._last_sampling_diagnostics
+    self._last_sampling_diagnostics = []
+    return records
 
   def _get_parameters(self):
     parameters = [self.backbone.parameters(),
@@ -1105,15 +1120,11 @@ class Diffusion(L.LightningModule):
             end = min(seqlen, ans_start + gen_len)
             gen_mask[b, ans_start:end] = True
 
-    # x_init: pin prefix, mask answer
-    # x_init = x0.clone()
-    # if token_mask is not None:
-    #   x_init[token_mask] = self.mask_index
-    # else:
-    #   x_init[:, 1:] = self.mask_index
+    sample_token_mask = gen_mask if gen_mask is not None else token_mask
+
     x_init = x0.clone()
-    if gen_mask is not None:
-        x_init[gen_mask] = self.mask_index
+    if sample_token_mask is not None:
+        x_init[sample_token_mask] = self.mask_index
     else:
         x_init[:, 1:] = self.mask_index
 
@@ -1121,84 +1132,113 @@ class Diffusion(L.LightningModule):
     cond = None
     if self.cross_attn:
       cond = x0.clone()
-      if token_mask is not None:
-        cond[gen_mask] = self.mask_index
+      if sample_token_mask is not None:
+        cond[sample_token_mask] = self.mask_index
       else:
         cond[:, 1:] = self.mask_index
 
-    # sample
-    if self.structured_inference:
-        # C-inf: 用 semi_ar，单 stride 覆盖整个序列，内部嵌入 span gating
-        print("[C-inf] Using semi_ar with block_size=seqlen + span gating")
-        x_out, _ = self._semi_ar_sampler(
-            n_samples=x_init.shape[0],
-            num_steps=num_steps,
-            num_strides=1,                # 关键：只跑 1 个 stride
-            seqlen=seqlen,
-            context_size=seqlen,
-            x_init=x_init,
-            cond=cond,
-            eps=eps,
-            cinf_token_mask=gen_mask,   # 新增：透传给内循环
-            cinf_num_steps=num_steps,
-        )
-    elif self.sampler == 'semi_ar':
-        x_out, _ = self._semi_ar_sampler(
-            n_samples=x_init.shape[0],
-            num_steps=num_steps,
-            num_strides=(seqlen // self.block_size),
-            seqlen=seqlen,
-            context_size=self.config.sampling.context_size,
-            x_init=x_init,
-            cond=None,
-        )
-    else:
-      x_out = self._analytic_sampler(
-        n_samples=x_init.shape[0],
-        num_steps=num_steps,
-        seqlen=seqlen,
-        eps=eps,
+    diagnostics_recorder = None
+    if self.diagnostics_enabled and sample_token_mask is not None:
+      num_strides_for_diag = 1 if self.structured_inference else (
+        max(1, (seqlen + self.block_size - 1) // self.block_size)
+        if self.sampler == 'semi_ar' else 1)
+      diagnostics_recorder = sampling_diagnostics.SamplingDiagnosticsRecorder(
+        tokenizer=self.tokenizer,
+        mask_index=self.mask_index,
+        snapshot_reveal_fractions=self.diagnostics_snapshot_reveal_fractions,
+        early_fraction=self.diagnostics_early_fraction)
+      diagnostics_recorder.start(
+        x0=x0,
         x_init=x_init,
-        cond=cond,
-      )
+        sample_token_mask=sample_token_mask,
+        num_steps=num_steps,
+        num_strides=num_strides_for_diag)
 
-    if self.ema:
-      self.ema.restore(self._get_parameters())
+    try:
+      if self.structured_inference:
+          print("[C-inf] Using semi_ar with block_size=seqlen + span gating")
+          x_out, _ = self._semi_ar_sampler(
+              n_samples=x_init.shape[0],
+              num_steps=num_steps,
+              num_strides=1,
+              seqlen=seqlen,
+              context_size=seqlen,
+              x_init=x_init,
+              cond=cond,
+              eps=eps,
+              cinf_token_mask=sample_token_mask,
+              cinf_num_steps=num_steps,
+              diagnostics_recorder=diagnostics_recorder,
+          )
+      elif self.sampler == 'semi_ar':
+          x_out, _ = self._semi_ar_sampler(
+              n_samples=x_init.shape[0],
+              num_steps=num_steps,
+              num_strides=(seqlen // self.block_size),
+              seqlen=seqlen,
+              context_size=self.config.sampling.context_size,
+              x_init=x_init,
+              cond=None,
+              diagnostics_recorder=diagnostics_recorder,
+          )
+      else:
+        x_out = self._analytic_sampler(
+          n_samples=x_init.shape[0],
+          num_steps=num_steps,
+          seqlen=seqlen,
+          eps=eps,
+          x_init=x_init,
+          cond=cond,
+          token_mask=sample_token_mask,
+          diagnostics_recorder=diagnostics_recorder,
+        )
 
-    # if x_out is None:
-    #   print("[DEBUG] x_out is None - sampling failed due to stop conditions")
-    #   return None
-    if x_out is None:
-      print("[DEBUG] x_out is None - sampling failed due to stop conditions")
-      print("[DEBUG] Retrying without stop conditions is not implemented; returning empty strings")
-      return [""] * batch['input_ids'].shape[0]
-    print(f"[DEBUG] x_out shape: {x_out.shape}")
-    print(f"[DEBUG] x_out sample (first 50): {x_out[0, :50].tolist()}")
-    print(f"[DEBUG] x_out sample (last 50): {x_out[0, -50:].tolist()}")
-    print(f"[DEBUG] token_mask shape: {token_mask.shape if token_mask is not None else None}")
-    if token_mask is not None:
-        print(f"[DEBUG] token_mask has any True: {token_mask[0].any().item()}")
-        if token_mask[0].any():
-            ans_pos = int(torch.where(token_mask[0])[0][0].item())
-            print(f"[DEBUG] ans_pos: {ans_pos}")
-            print(f"[DEBUG] answer region tokens: {x_out[0, ans_pos:ans_pos+20].tolist()}")
+      if self.ema:
+        self.ema.restore(self._get_parameters())
 
-    if return_full_sequence:
-      return self.tokenizer.batch_decode(x_out)
+      if x_out is None:
+        self._last_sampling_diagnostics = []
+        print("[DEBUG] x_out is None - sampling failed due to stop conditions")
+        print("[DEBUG] Retrying without stop conditions is not implemented; returning empty strings")
+        return [""] * batch['input_ids'].shape[0]
 
-    # return only answer part (cut from first answer position, stop at EOS)
-    if token_mask is None:
-      return self.tokenizer.batch_decode(x_out)
+      if diagnostics_recorder is not None:
+        diagnostics_recorder.finalize(x_out)
+        self._last_sampling_diagnostics = diagnostics_recorder.get_records()
+      else:
+        self._last_sampling_diagnostics = []
 
-    out_texts = []
-    for b in range(x_out.shape[0]):
-      ans_pos = int(torch.where(token_mask[b])[0][0].item()) if token_mask[b].any() else 0
-      seq = x_out[b, ans_pos:]
-      eos = torch.where(seq == self.tokenizer.eos_token_id)[0]
-      if len(eos) > 0:
-        seq = seq[: int(eos[0].item()) + 1]
-      out_texts.append(self.tokenizer.decode(seq, skip_special_tokens=True))
-    return out_texts
+      print(f"[DEBUG] x_out shape: {x_out.shape}")
+      print(f"[DEBUG] x_out sample (first 50): {x_out[0, :50].tolist()}")
+      print(f"[DEBUG] x_out sample (last 50): {x_out[0, -50:].tolist()}")
+      print(f"[DEBUG] token_mask shape: {sample_token_mask.shape if sample_token_mask is not None else None}")
+      if sample_token_mask is not None:
+          print(f"[DEBUG] token_mask has any True: {sample_token_mask[0].any().item()}")
+          if sample_token_mask[0].any():
+              ans_pos = int(torch.where(sample_token_mask[0])[0][0].item())
+              print(f"[DEBUG] ans_pos: {ans_pos}")
+              print(f"[DEBUG] answer region tokens: {x_out[0, ans_pos:ans_pos+20].tolist()}")
+
+      if return_full_sequence:
+        return self.tokenizer.batch_decode(x_out)
+
+      if token_mask is None:
+        return self.tokenizer.batch_decode(x_out)
+
+      out_texts = []
+      for b in range(x_out.shape[0]):
+        ans_pos = int(torch.where(token_mask[b])[0][0].item()) if token_mask[b].any() else 0
+        seq = x_out[b, ans_pos:]
+        eos = torch.where(seq == self.tokenizer.eos_token_id)[0]
+        if len(eos) > 0:
+          seq = seq[: int(eos[0].item()) + 1]
+        out_texts.append(self.tokenizer.decode(seq, skip_special_tokens=True))
+      return out_texts
+    finally:
+      if self.structured_inference and hasattr(self, '_orig_block_size'):
+        self.block_size = self._orig_block_size
+        if hasattr(self.backbone, 'block_size'):
+          self.backbone.block_size = self._orig_block_size
 
 
   def restore_model_and_sample(self, num_steps, eps=1e-5, seqlen=None):
@@ -1819,7 +1859,8 @@ class Diffusion(L.LightningModule):
     
   @torch.no_grad
   def _analytic_sampler(
-    self, n_samples, num_steps, seqlen, eps=1e-5, x_init=None, cond=None,token_mask=None): 
+    self, n_samples, num_steps, seqlen, eps=1e-5, x_init=None, cond=None,
+    token_mask=None, diagnostics_recorder=None): 
     # x = self._sample_prior(
     #   n_samples,
     #   seqlen).to(self.device)
@@ -1853,6 +1894,12 @@ class Diffusion(L.LightningModule):
       else:
           x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
 
+      if diagnostics_recorder is not None:
+        diagnostics_recorder.record_step(
+          x_current=x,
+          step_index=i + 1,
+          t_value=float(t[0, 0].item()))
+
 
     #     x = torch.where(token_mask, x, x_init_device)
     # denoising step
@@ -1872,6 +1919,12 @@ class Diffusion(L.LightningModule):
     # ===== 钉住 prefix =====
     if x_init_device is not None and token_mask is not None:
         x = torch.where(token_mask, x, x_init_device)
+
+    if diagnostics_recorder is not None:
+      diagnostics_recorder.record_step(
+        x_current=x,
+        step_index=num_steps,
+        t_value=float(t[0, 0].item()))
 
     # ===== 修改：conditional 生成跳过 entropy stop =====
     # conditional 生成的输出可能合理地低熵（如摘要任务），
@@ -1902,6 +1955,7 @@ class Diffusion(L.LightningModule):
       cond=None,     # 兼容旧调用：传 cond=... 时映射到 cond_stream
       cinf_token_mask=None,   # 新增
       cinf_num_steps=None,
+      diagnostics_recorder=None,
   ):
       """
       Semi-autoregressive / stride-wise sampler.
@@ -2010,6 +2064,13 @@ class Diffusion(L.LightningModule):
                   sampling_steps += 1
 
               x_accum[:, fwd_idx] = x_next
+
+              if diagnostics_recorder is not None:
+                  diagnostics_recorder.record_step(
+                      x_current=x_accum,
+                      step_index=(stride_num * num_steps) + i + 1,
+                      t_value=float(t),
+                  )
 
           # 3) 可选：variable-length / stop 条件（保留原逻辑，但修掉 x 未定义的问题）
           # if x_accum.shape[1] > 256:

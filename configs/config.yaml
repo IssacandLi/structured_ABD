@@ -35,6 +35,12 @@ sampling:
   first_hitting: True # should be set to true when T >> block_size
   kv_cache: False
 
+diagnostics:
+  enabled: False
+  save_path: null
+  snapshot_reveal_fractions: [0.1, 0.3, 0.5, 0.7]
+  early_fraction: 0.3
+
 training:
   ema: 0.9999
   antithetic_sampling: True

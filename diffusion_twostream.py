@@ -14,6 +14,7 @@ import dataloader
 import metrics
 import models
 import noise_schedule
+import sampling_diagnostics
 import utils
 import numpy as np
 import itertools
@@ -141,6 +142,15 @@ class Diffusion(L.LightningModule):
       
     self.time_conditioning = self.config.algo.time_conditioning
     self.neg_infinity = -1000000.0
+
+    diagnostics_cfg = getattr(self.config, 'diagnostics', None)
+    self.diagnostics_enabled = bool(
+      getattr(diagnostics_cfg, 'enabled', False))
+    self.diagnostics_snapshot_reveal_fractions = list(
+      getattr(diagnostics_cfg, 'snapshot_reveal_fractions', [0.1, 0.3, 0.5, 0.7]))
+    self.diagnostics_early_fraction = float(
+      getattr(diagnostics_cfg, 'early_fraction', 0.3))
+    self._last_sampling_diagnostics = []
   
     # --- C-inf: Structured Unmasking at Inference ---
 
@@ -169,6 +179,11 @@ class Diffusion(L.LightningModule):
     self.fast_forward_epochs = None
     self.fast_forward_batches = None
     self._validate_configuration()
+
+  def pop_last_sampling_diagnostics(self):
+    records = self._last_sampling_diagnostics
+    self._last_sampling_diagnostics = []
+    return records
 
   def _get_parameters(self):
     parameters = [self.backbone.parameters(),
@@ -1129,6 +1144,23 @@ class Diffusion(L.LightningModule):
       else:
         cond[:, 1:] = self.mask_index
 
+    diagnostics_recorder = None
+    if self.diagnostics_enabled and sample_token_mask is not None:
+      num_strides_for_diag = 1 if self.structured_inference else (
+        max(1, (seqlen + self.block_size - 1) // self.block_size)
+        if self.sampler == 'semi_ar' else 1)
+      diagnostics_recorder = sampling_diagnostics.SamplingDiagnosticsRecorder(
+        tokenizer=self.tokenizer,
+        mask_index=self.mask_index,
+        snapshot_reveal_fractions=self.diagnostics_snapshot_reveal_fractions,
+        early_fraction=self.diagnostics_early_fraction)
+      diagnostics_recorder.start(
+        x0=x0,
+        x_init=x_init,
+        sample_token_mask=sample_token_mask,
+        num_steps=num_steps,
+        num_strides=num_strides_for_diag)
+
     try:
       # sample
       if self.structured_inference:
@@ -1145,6 +1177,7 @@ class Diffusion(L.LightningModule):
               eps=eps,
               cinf_token_mask=sample_token_mask,
               cinf_num_steps=num_steps,
+              diagnostics_recorder=diagnostics_recorder,
           )
       elif self.sampler == 'semi_ar':
           x_out, _ = self._semi_ar_sampler(
@@ -1155,6 +1188,7 @@ class Diffusion(L.LightningModule):
               context_size=self.config.sampling.context_size,
               x_init=x_init,
               cond=None,
+              diagnostics_recorder=diagnostics_recorder,
           )
       else:
         x_out = self._analytic_sampler(
@@ -1164,15 +1198,24 @@ class Diffusion(L.LightningModule):
           eps=eps,
           x_init=x_init,
           cond=cond,
+          token_mask=sample_token_mask,
+          diagnostics_recorder=diagnostics_recorder,
         )
 
       if self.ema:
         self.ema.restore(self._get_parameters())
 
       if x_out is None:
+        self._last_sampling_diagnostics = []
         print("[DEBUG] x_out is None - sampling failed due to stop conditions")
         print("[DEBUG] Retrying without stop conditions is not implemented; returning empty strings")
         return [""] * batch['input_ids'].shape[0]
+
+      if diagnostics_recorder is not None:
+        diagnostics_recorder.finalize(x_out)
+        self._last_sampling_diagnostics = diagnostics_recorder.get_records()
+      else:
+        self._last_sampling_diagnostics = []
       print(f"[DEBUG] x_out shape: {x_out.shape}")
       print(f"[DEBUG] x_out sample (first 50): {x_out[0, :50].tolist()}")
       print(f"[DEBUG] x_out sample (last 50): {x_out[0, -50:].tolist()}")
@@ -1887,7 +1930,8 @@ class Diffusion(L.LightningModule):
     
   @torch.no_grad
   def _analytic_sampler(
-    self, n_samples, num_steps, seqlen, eps=1e-5, x_init=None, cond=None,token_mask=None): 
+    self, n_samples, num_steps, seqlen, eps=1e-5, x_init=None, cond=None,
+    token_mask=None, diagnostics_recorder=None): 
     # x = self._sample_prior(
     #   n_samples,
     #   seqlen).to(self.device)
@@ -1921,6 +1965,12 @@ class Diffusion(L.LightningModule):
       else:
           x = self._analytic_update(x=x, t=t, dt=dt, cond=cond)
 
+      if diagnostics_recorder is not None:
+        diagnostics_recorder.record_step(
+          x_current=x,
+          step_index=i + 1,
+          t_value=float(t[0, 0].item()))
+
 
     #     x = torch.where(token_mask, x, x_init_device)
     # denoising step
@@ -1940,6 +1990,12 @@ class Diffusion(L.LightningModule):
     # ===== 钉住 prefix =====
     if x_init_device is not None and token_mask is not None:
         x = torch.where(token_mask, x, x_init_device)
+
+    if diagnostics_recorder is not None:
+      diagnostics_recorder.record_step(
+        x_current=x,
+        step_index=num_steps,
+        t_value=float(t[0, 0].item()))
 
     # ===== 修改：conditional 生成跳过 entropy stop =====
     # conditional 生成的输出可能合理地低熵（如摘要任务），
@@ -1970,6 +2026,7 @@ class Diffusion(L.LightningModule):
       cond=None,     # 兼容旧调用：传 cond=... 时映射到 cond_stream
       cinf_token_mask=None,   # 新增
       cinf_num_steps=None,
+      diagnostics_recorder=None,
   ):
       """
       Semi-autoregressive / stride-wise sampler.
@@ -2078,6 +2135,13 @@ class Diffusion(L.LightningModule):
                   sampling_steps += 1
 
               x_accum[:, fwd_idx] = x_next
+
+              if diagnostics_recorder is not None:
+                  diagnostics_recorder.record_step(
+                      x_current=x_accum,
+                      step_index=(stride_num * num_steps) + i + 1,
+                      t_value=float(t),
+                  )
 
           # 3) 可选：variable-length / stop 条件（保留原逻辑，但修掉 x 未定义的问题）
           # if x_accum.shape[1] > 256:

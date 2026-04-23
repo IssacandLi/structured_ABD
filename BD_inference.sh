@@ -5,12 +5,12 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2
 #SBATCH --nodelist=sn17
-#SBATCH --gres=gpu:tesla:2
+#SBATCH --gres=gpu:tesla:1
 #SBATCH --mem=300000
 
 module load anaconda3
 source activate /data/lab/yan/peihong_li/condaenvlist/bd3lm
-cd /data/lab/yan/peihong_li/ACL/structure_ABD/
+cd /data/lab/yan/peihong_li/ACL/structure_ABD_rouge/
 
 BLOCK_SIZE=4
 
@@ -37,8 +37,12 @@ python -u main.py \
   sampling.num_eval_samples=100 \
   +sampling.context_size=512 \
   sampling.logdir=$PWD/sample_logs/cnn_dm_cond_bs4_100samples.csv \
+  diagnostics.enabled=True \
+  diagnostics.save_path=$PWD/sample_logs/cnn_dm_cond_bs4_100samples_diagnostics.json \
+  'diagnostics.snapshot_reveal_fractions=[0.1,0.3,0.5,0.7]' \
+  diagnostics.early_fraction=0.3 \
   ++eval.conditional_metric=rouge \
-  eval.checkpoint_path=$PWD/outputs/cnn_dailymail/2026.04.16/155216/checkpoints/best.ckpt \
+  eval.checkpoint_path=/data/lab/yan/peihong_li/ACL/structure_ABD/outputs/cnn_dailymail/2026.04.21/165620/checkpoints/best.ckpt \
   algo.structured_masking.enabled=True \
   algo.structured_masking.r_low=0.3 \
   algo.structured_masking.r_high=0.7 \

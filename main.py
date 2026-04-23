@@ -89,10 +89,27 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     print(f'Last {k} tokens:', tokenizer.decode(last))
     print('ids:', last)
 
+
+def _diagnostics_enabled(config):
+  return bool(getattr(getattr(config, 'diagnostics', None), 'enabled', False))
+
+
+def _diagnostics_save_path(config):
+  diagnostics_cfg = getattr(config, 'diagnostics', None)
+  custom_path = getattr(diagnostics_cfg, 'save_path', None)
+  if custom_path:
+    return str(custom_path)
+  log_path = str(config.sampling.logdir)
+  stem, ext = os.path.splitext(log_path)
+  if ext:
+    return f'{stem}_diagnostics.json'
+  return f'{log_path}_diagnostics.json'
+
 def generate_samples(config, logger, tokenizer):
   conditional = bool(getattr(config.data, "conditional_generation", False))
   conditional_metric = str(
     getattr(config.eval, 'conditional_metric', 'rouge')).lower()
+  diagnostics_enabled = _diagnostics_enabled(config)
   logger.info('Generating samples.')
   model = _load_from_checkpoint(config=config,
                                 tokenizer=tokenizer)
@@ -108,6 +125,7 @@ def generate_samples(config, logger, tokenizer):
     preds = []
     prefixes = []
     gts = []
+    diagnostic_records = []
 
     num_batches = int(getattr(config.sampling, "num_cond_batches", 1))
     num_batches = max(1, num_batches)
@@ -130,6 +148,8 @@ def generate_samples(config, logger, tokenizer):
         batch=batch,
         token_mask_key='attention_mask',
         return_full_sequence=False)
+      batch_diagnostics = model.pop_last_sampling_diagnostics() \
+        if diagnostics_enabled else []
 
       if pred_i is None:
         logger.warning(f"[Batch {b_idx}] Sampling returned None, skipping")
@@ -165,8 +185,24 @@ def generate_samples(config, logger, tokenizer):
         if tokenizer.eos_token_id in gt_ids:
           gt_ids = gt_ids[:gt_ids.index(tokenizer.eos_token_id)]
 
-        prefixes.append(tokenizer.decode(prefix_ids, skip_special_tokens=True))
-        gts.append(tokenizer.decode(gt_ids, skip_special_tokens=True))
+        prefix_text = tokenizer.decode(prefix_ids, skip_special_tokens=True)
+        gt_text = tokenizer.decode(gt_ids, skip_special_tokens=True)
+        pred_text = pred_i[i]
+
+        prefixes.append(prefix_text)
+        gts.append(gt_text)
+
+        if diagnostics_enabled:
+          if i < len(batch_diagnostics):
+            diag_record = batch_diagnostics[i]
+          else:
+            diag_record = {}
+          diag_record['global_sample_index'] = len(diagnostic_records)
+          diag_record['prefix_text'] = prefix_text
+          diag_record['gt_text'] = gt_text
+          diag_record['pred_text'] = pred_text
+          diag_record['seed'] = int(config.seed)
+          diagnostic_records.append(diag_record)
 
       preds.extend(pred_i[:batch_size])
       if target_num_samples > 0 and len(preds) >= target_num_samples:
@@ -222,6 +258,34 @@ def generate_samples(config, logger, tokenizer):
     save_dict.update(metric_save_dict)
 
     utils.update_and_save_csv(save_dict, csv_path)
+
+    if diagnostics_enabled:
+      for i, record in enumerate(diagnostic_records):
+        eval_metrics = {}
+        for metric_name, metric_values in metric_save_dict.items():
+          if i < len(metric_values):
+            eval_metrics[metric_name] = float(metric_values[i])
+        record['eval_metrics'] = eval_metrics
+
+      diagnostics_payload = {
+        'meta': {
+          'seed': int(config.seed),
+          'data_valid': str(config.data.valid),
+          'checkpoint_path': str(config.eval.checkpoint_path),
+          'conditional_metric': conditional_metric,
+          'num_samples': int(len(diagnostic_records)),
+          'sampling_logdir': str(config.sampling.logdir),
+          'snapshot_reveal_fractions': list(
+            getattr(config.diagnostics, 'snapshot_reveal_fractions', [])),
+          'early_fraction': float(getattr(config.diagnostics, 'early_fraction', 0.3)),
+          'structured_inference_enabled': bool(
+            getattr(getattr(config.algo, 'structured_inference', None), 'enabled', False)),
+        },
+        'records': diagnostic_records,
+      }
+      diagnostics_path = _diagnostics_save_path(config)
+      utils.save_json(diagnostics_payload, diagnostics_path)
+      logger.info(f'Saved sampling diagnostics to {diagnostics_path}')
     return preds
 
 

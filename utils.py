@@ -6,8 +6,10 @@ Copied from https://docs.python.org/3/howto/logging-cookbook.html#using-a-contex
 
 import csv
 import functools
+import json
 import logging
 import math
+import os
 
 import fsspec
 import lightning
@@ -59,6 +61,14 @@ def update_and_save_csv(save_dict, csv_path):
     for i in range(num_samples):
       row = {k: v[i] for k, v in save_dict.items()}
       writer.writerow(row)
+
+
+def save_json(data, path):
+  dirname = os.path.dirname(path)
+  if dirname:
+    fsspec_mkdirs(dirname, exist_ok=True)
+  with fsspec.open(path, 'w') as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
 
 class CosineDecayWarmupLRScheduler(
   CosineLRScheduler,
