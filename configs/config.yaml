@@ -28,6 +28,7 @@ sampling:
   noise_removal: False
   num_sample_batches: 1  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
   num_cond_batches: 1
+  num_eval_samples: 0  # If > 0, conditional eval stops after exactly this many samples.
   var_length: False
   logdir: ./samples_${algo.name}_len${model.length}_blocksize${block_size}
   nucleus_p: 1.0

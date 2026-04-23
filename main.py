@@ -111,6 +111,13 @@ def generate_samples(config, logger, tokenizer):
 
     num_batches = int(getattr(config.sampling, "num_cond_batches", 1))
     num_batches = max(1, num_batches)
+    target_num_samples = int(getattr(config.sampling, 'num_eval_samples', 0) or 0)
+    if target_num_samples > 0:
+      per_batch = max(1, int(config.loader.eval_batch_size))
+      num_batches = max(1, (target_num_samples + per_batch - 1) // per_batch)
+      logger.info(
+        f'Conditional evaluation target: {target_num_samples} samples '
+        f'(eval_batch_size={per_batch}, num_batches={num_batches}).')
 
     model.backbone.eval()
     for b_idx, batch in enumerate(valid_dl):
@@ -128,12 +135,21 @@ def generate_samples(config, logger, tokenizer):
         logger.warning(f"[Batch {b_idx}] Sampling returned None, skipping")
         continue
 
+      batch_size = min(len(pred_i), int(batch['input_ids'].shape[0]))
+      if target_num_samples > 0:
+        remaining = target_num_samples - len(preds)
+        if remaining <= 0:
+          break
+        batch_size = min(batch_size, remaining)
+      if batch_size <= 0:
+        break
+
       # Extract prefix text + ground-truth answer from batch for logging
       input_ids = batch['input_ids']
       mask = batch['attention_mask']
       pad_id = tokenizer.pad_token_id
 
-      for i in range(input_ids.shape[0]):
+      for i in range(batch_size):
         ids = input_ids[i].tolist()
         m = mask[i].tolist()
 
@@ -152,14 +168,18 @@ def generate_samples(config, logger, tokenizer):
         prefixes.append(tokenizer.decode(prefix_ids, skip_special_tokens=True))
         gts.append(tokenizer.decode(gt_ids, skip_special_tokens=True))
 
-      # pred_i is a list length = batch size
-      preds.extend(pred_i)
+      preds.extend(pred_i[:batch_size])
+      if target_num_samples > 0 and len(preds) >= target_num_samples:
+        break
+
+    logger.info(f'Collected {len(preds)} conditional samples for evaluation.')
     model.metrics.reset()
     if conditional_metric == 'rouge':
       model.metrics.record_rouge_scores(
         predictions=preds,
         references=gts,
       )
+      print('Num evaluated samples:', len(preds))
       print('ROUGE-1:', float(model.metrics.gen_rouge1.compute()))
       print('ROUGE-2:', float(model.metrics.gen_rouge2.compute()))
       print('ROUGE-L:', float(model.metrics.gen_rougeL.compute()))
@@ -175,6 +195,7 @@ def generate_samples(config, logger, tokenizer):
           max_length=2048,
           device='cuda',
       )
+      print('Num evaluated samples:', len(preds))
       print('Generative perplexity:', float(model.metrics.gen_ppl.compute()))
       metric_save_dict = {
         'gen_ppl': model.metrics.gen_ppls,

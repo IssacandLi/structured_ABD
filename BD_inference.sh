@@ -34,8 +34,10 @@ python -u main.py \
   data.cache_dir=/data/lab/yan/peihong_li/data_cache/cdm_cnn_dm_dat \
   sampling.nucleus_p=0.9 \
   sampling.kv_cache=false \
+  sampling.num_eval_samples=100 \
   +sampling.context_size=512 \
-  sampling.logdir=$PWD/sample_logs/cnn_dm_cond_bs4 \
+  sampling.logdir=$PWD/sample_logs/cnn_dm_cond_bs4_100samples.csv \
+  ++eval.conditional_metric=rouge \
   eval.checkpoint_path=$PWD/outputs/cnn_dailymail/2026.04.16/155216/checkpoints/best.ckpt \
   algo.structured_masking.enabled=True \
   algo.structured_masking.r_low=0.3 \
